@@ -7,6 +7,7 @@
 #include <vector>
 #include "CardLayout.h"
 #include "ExcelReader.h"
+#include "ImageMatcher.h"
 
 class QAction;
 class QActionGroup;
@@ -34,6 +35,9 @@ public:
 
     // 載入 Excel 製卡資料 (成功回傳 true；失敗會跳出訊息視窗)
     bool loadData(const QString& path);
+
+    // 設定圖片資料夾 (空字串 = 不使用)。圖片元素的「圖片路徑」留空時，會依資料欄位自動到此資料夾找圖
+    void setImageFolder(const QString& dir);
 
 protected:
     void showEvent(QShowEvent* ev) override;
@@ -70,6 +74,11 @@ private:
     void stepRecord(int delta);
     void applyDataFilter(const QString& text);
     void updateDataInfo();
+
+    // 圖片自動對應 (階段 2)
+    void browseImageFolder();
+    void refreshImageMatches();            // 重算「圖片」欄、統計，並更新預覽
+    QString matchField() const;
 
     // 面板與清單
     void populatePanel(const card::Element* e);
@@ -137,4 +146,10 @@ private:
     QLabel* dataInfo_ = nullptr;
     QLineEdit* dataFilter_ = nullptr;
     QString lastDataDir_;
+
+    // 圖片自動對應
+    card::ImageMatcher imageMatcher_;
+    QLineEdit* imageDirEdit_ = nullptr;
+    QComboBox* matchFieldCombo_ = nullptr;
+    QLabel* imageSummary_ = nullptr;
 };

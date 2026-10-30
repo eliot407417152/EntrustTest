@@ -20,6 +20,7 @@
 #include <QGraphicsView>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHash>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
@@ -31,6 +32,8 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSettings>
+#include <QSignalBlocker>
 #include <QShowEvent>
 #include <QStatusBar>
 #include <QTableWidget>
@@ -210,7 +213,7 @@ void DesignerWindow::resetDockLayout() {
 }
 
 void DesignerWindow::applyDockSizes() {
-    resizeDocks({ elementDock_, dataDock_ }, { 220, 420 }, Qt::Vertical);
+    resizeDocks({ elementDock_, dataDock_ }, { 190, 480 }, Qt::Vertical);
     resizeDocks({ elementDock_, propertyDock_ }, { 390, 350 }, Qt::Horizontal);
 }
 
@@ -376,7 +379,9 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     imageGroup_ = new QGroupBox(tr("圖片"));
     auto* imf = new QFormLayout(imageGroup_);
     imageEdit_ = new QLineEdit;
-    imageEdit_->setPlaceholderText(tr("圖片檔路徑，可含 {欄位}，例如 D:\\photos\\{學號}.jpg"));
+    imageEdit_->setPlaceholderText(tr("留空 = 依「圖片資料夾」自動比對；或填固定路徑 / 含 {欄位} 的路徑"));
+    imageEdit_->setToolTip(tr("留空：依「製卡資料」面板設定的圖片資料夾與比對欄位，自動帶入對應照片\n"
+        "填路徑：固定使用該圖片 (例如公司 Logo)，或用 {學號} 這類欄位組出路徑，例如 D:\\photos\\{學號}.jpg"));
     auto* browse = new QPushButton(tr("選擇…"));
     auto* pathRow = new QWidget;
     auto* pl = new QHBoxLayout(pathRow);
@@ -496,14 +501,39 @@ QWidget* DesignerWindow::buildDataPanel() {
     top->addWidget(dataInfo_, 1);
     v->addLayout(top);
 
+    // ---- 圖片對應：指定資料夾 + 用哪個欄位去比對檔名 ----
+    auto* imgGroup = new QGroupBox(tr("圖片對應 (自動帶入照片)"));
+    auto* ig = new QVBoxLayout(imgGroup);
+    auto* dirRow = new QHBoxLayout;
+    imageDirEdit_ = new QLineEdit;
+    imageDirEdit_->setPlaceholderText(tr("圖片資料夾路徑"));
+    auto* dirBtn = new QPushButton(tr("選擇…"));
+    dirRow->addWidget(imageDirEdit_, 1);
+    dirRow->addWidget(dirBtn);
+    ig->addLayout(dirRow);
+    auto* matchRow = new QHBoxLayout;
+    matchFieldCombo_ = new QComboBox;
+    matchFieldCombo_->addItems(card::fieldNames());
+    matchFieldCombo_->setToolTip(tr("用這個欄位的值，去找「檔名包含該值」的圖片"));
+    auto* rescanBtn = new QPushButton(tr("重新掃描"));
+    rescanBtn->setToolTip(tr("資料夾內的圖片有增減時按這裡"));
+    matchRow->addWidget(new QLabel(tr("以此欄位比對檔名：")));
+    matchRow->addWidget(matchFieldCombo_, 1);
+    matchRow->addWidget(rescanBtn);
+    ig->addLayout(matchRow);
+    imageSummary_ = new QLabel;
+    imageSummary_->setWordWrap(true);
+    ig->addWidget(imageSummary_);
+    v->addWidget(imgGroup);
+
     dataFilter_ = new QLineEdit;
     dataFilter_->setPlaceholderText(tr("搜尋 (姓名、學號、系所…)"));
     dataFilter_->setClearButtonEnabled(true);
     v->addWidget(dataFilter_);
 
     const QStringList& fields = card::fieldNames();
-    dataTable_ = new QTableWidget(0, fields.size());
-    dataTable_->setHorizontalHeaderLabels(fields);
+    dataTable_ = new QTableWidget(0, fields.size() + 1);          // 最後一欄是「圖片」比對結果
+    dataTable_->setHorizontalHeaderLabels(QStringList(fields) << tr("圖片"));
     dataTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     dataTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     dataTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -517,6 +547,31 @@ QWidget* DesignerWindow::buildDataPanel() {
     connect(dataTable_, &QTableWidget::currentCellChanged, this, [this](int row, int, int, int) {
         if (row >= 0) applyDataRow(row);
         });
+
+    connect(dirBtn, &QPushButton::clicked, this, [this] { browseImageFolder(); });
+    connect(imageDirEdit_, &QLineEdit::editingFinished, this, [this] {
+        if (imageDirEdit_->text().trimmed() != imageMatcher_.folder()) setImageFolder(imageDirEdit_->text());
+        });
+    connect(rescanBtn, &QPushButton::clicked, this, [this] {
+        imageMatcher_.rescan();
+        refreshImageMatches();
+        });
+    connect(matchFieldCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"))
+            .setValue(QStringLiteral("matchField"), matchField());
+        refreshImageMatches();
+        });
+
+    // 還原上次的設定
+    {
+        QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));
+        const int i = matchFieldCombo_->findText(st.value(QStringLiteral("matchField"), QStringLiteral("姓名")).toString());
+        if (i >= 0) { QSignalBlocker b(matchFieldCombo_); matchFieldCombo_->setCurrentIndex(i); }
+        const QString dir = st.value(QStringLiteral("imageFolder")).toString();
+        imageDirEdit_->setText(dir);
+        imageMatcher_.setFolder(dir);
+    }
+    refreshImageMatches();
     return w;
 }
 
@@ -526,6 +581,7 @@ void DesignerWindow::applyPreviewRecord() {
     previewRecord_.clear();
     if (usePreviewCheck_ && usePreviewCheck_->isChecked()) {
         for (const auto& pr : previewEdits_) previewRecord_.insert(pr.first, pr.second->text());
+        imageMatcher_.applyTo(previewRecord_, matchField());      // 依比對欄位帶入圖片
     }
     if (scene_) scene_->update();
 }
@@ -717,6 +773,7 @@ bool DesignerWindow::loadData(const QString& path) {
     dataFilter_->blockSignals(false);
     dataTable_->blockSignals(false);
 
+    refreshImageMatches();
     updateDataInfo();
     updateActionStates();
     dataDock_->show();
@@ -730,6 +787,114 @@ bool DesignerWindow::loadData(const QString& path) {
     applyDataRow(0);                       // 重新載入時選取列可能沒變，所以明確套用第一筆
     statusBar()->showMessage(tr("已載入 %1：共 %2 筆").arg(QFileInfo(path).fileName()).arg(data_.rows.size()), 6000);
     return true;
+}
+
+QString DesignerWindow::matchField() const {
+    return matchFieldCombo_ ? matchFieldCombo_->currentText() : card::fieldNames().value(0);
+}
+
+void DesignerWindow::browseImageFolder() {
+    const QString start = imageMatcher_.hasFolder() ? imageMatcher_.folder() : lastDataDir_;
+    const QString dir = QFileDialog::getExistingDirectory(this, tr("選擇圖片資料夾"), start);
+    if (!dir.isEmpty()) setImageFolder(dir);
+}
+
+void DesignerWindow::setImageFolder(const QString& dir) {
+    const QString d = dir.trimmed().isEmpty() ? QString() : QDir::toNativeSeparators(dir.trimmed());
+    if (!d.isEmpty() && !QDir(d).exists()) {
+        QMessageBox::warning(this, tr("資料夾不存在"), d);
+        imageDirEdit_->setText(imageMatcher_.folder());
+        return;
+    }
+    imageMatcher_.setFolder(d);
+    imageDirEdit_->setText(d);
+    QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"))
+        .setValue(QStringLiteral("imageFolder"), d);
+    refreshImageMatches();
+}
+
+// 依目前的資料夾與比對欄位，重算每一筆資料的圖片對應結果，更新表格「圖片」欄、統計文字與預覽
+void DesignerWindow::refreshImageMatches() {
+    const int imgCol = dataTable_->columnCount() - 1;
+    const QString field = matchField();
+    const bool hasFolder = imageMatcher_.hasFolder();
+
+    // 資料本身重名 (比對欄位內相同的值出現多次)：就算圖片只有一張，也不知道該給誰
+    QHash<QString, int> valueCount;
+    for (const auto& rec : data_.rows) {
+        const QString k = rec.value(field).trimmed().toLower();
+        if (!k.isEmpty()) valueCount[k]++;
+    }
+
+    int ok = 0, notFound = 0, imgDup = 0, dataDup = 0, noValue = 0;
+    dataTable_->setUpdatesEnabled(false);
+    for (int r = 0; r < data_.rows.size(); ++r) {
+        auto* item = new QTableWidgetItem;
+        if (!hasFolder) {
+            item->setText(QStringLiteral("—"));
+            item->setForeground(QColor(150, 150, 150));
+        }
+        else {
+            const QString value = data_.rows[r].value(field);
+            const card::ImageMatch m = imageMatcher_.find(value);
+            const int same = valueCount.value(value.trimmed().toLower());
+            if (m.status == card::ImageMatch::NoValue) {
+                item->setText(tr("－ %1 無資料").arg(field));
+                item->setBackground(QColor(255, 215, 215));
+                ++noValue;
+            }
+            else if (same > 1) {
+                item->setText(tr("⚠ 資料重名 ×%1").arg(same));
+                item->setBackground(QColor(255, 215, 170));
+                item->setToolTip(tr("比對欄位「%1」有 %2 筆資料的值都是「%3」，無法確定該用哪張圖。").arg(field).arg(same).arg(value));
+                ++dataDup;
+            }
+            else if (m.status == card::ImageMatch::Ambiguous) {
+                item->setText(tr("⚠ %1 張符合").arg(m.candidates.size()));
+                item->setBackground(QColor(255, 215, 170));
+                item->setToolTip(tr("符合的檔案：\n") + m.candidates.join(QLatin1Char('\n')));
+                ++imgDup;
+            }
+            else if (m.status == card::ImageMatch::NotFound) {
+                item->setText(tr("✘ 找不到"));
+                item->setBackground(QColor(255, 243, 190));
+                ++notFound;
+            }
+            else {
+                item->setText(QStringLiteral("✔ ") + m.candidates.value(0));
+                item->setToolTip(m.path);
+                ++ok;
+            }
+        }
+        dataTable_->setItem(r, imgCol, item);
+    }
+    dataTable_->setUpdatesEnabled(true);
+
+    // 統計文字
+    QString s;
+    if (!hasFolder && !imageDirEdit_->text().trimmed().isEmpty()) {
+        s = tr("找不到資料夾：%1").arg(imageDirEdit_->text().trimmed());
+    }
+    else if (!hasFolder) {
+        s = tr("尚未設定圖片資料夾。圖片元素的「圖片路徑」留空時，會依此處設定自動帶入照片。");
+    }
+    else {
+        s = tr("資料夾內有 %1 張圖片。").arg(imageMatcher_.fileCount());
+        if (data_.rows.isEmpty()) {
+            s += tr("載入資料後會顯示每一筆的比對結果。");
+        }
+        else {
+            s += tr("\n以「%1」比對 %2 筆：✔ 可用 %3").arg(field).arg(data_.rows.size()).arg(ok);
+            if (notFound) s += tr("、✘ 找不到 %1").arg(notFound);
+            if (imgDup) s += tr("、⚠ 圖片重名 %1").arg(imgDup);
+            if (dataDup) s += tr("、⚠ 資料重名 %1").arg(dataDup);
+            if (noValue) s += tr("、欄位無資料 %1").arg(noValue);
+            if (imgDup || dataDup) s += tr("\n重名的資料不會被當成「可用」，建議改用較不會重複的欄位 (例如學號)。");
+        }
+    }
+    imageSummary_->setText(s);
+
+    applyPreviewRecord();                  // 目前預覽的那一筆也要換圖
 }
 
 void DesignerWindow::applyDataRow(int row) {

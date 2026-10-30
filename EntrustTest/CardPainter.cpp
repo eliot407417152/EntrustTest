@@ -1,4 +1,5 @@
 ﻿#include "CardPainter.h"
+#include "ImageMatcher.h"
 
 #include <QCache>
 #include <QFileInfo>
@@ -55,7 +56,9 @@ namespace card {
             p.drawText(r, flags, substitute(e.text, rec));
         }
         else {
-            const QString path = substitute(e.imagePath, rec);
+            // 圖片路徑留空 = 自動比對：使用 ImageMatcher 依資料欄位在圖片資料夾找到的圖
+            const bool autoMode = e.imagePath.trimmed().isEmpty();
+            const QString path = autoMode ? rec.value(autoImageKey()) : substitute(e.imagePath, rec);
             const QImage img = loadImageCached(path);
             if (img.isNull()) {
                 // 找不到圖片：畫虛線框 + 提示，方便在預覽時發現問題
@@ -68,7 +71,9 @@ namespace card {
                 p.setFont(f);
                 p.setPen(QColor(120, 120, 120));
                 p.drawText(r.adjusted(2, 2, -2, -2), int(Qt::AlignCenter) | int(Qt::TextWordWrap),
-                    path.isEmpty() ? QStringLiteral("[圖片]") : path);
+                    !path.isEmpty() ? path
+                    : (autoMode && !rec.value(autoImageNoteKey()).isEmpty() ? rec.value(autoImageNoteKey())
+                        : QStringLiteral("[圖片]")));
             }
             else {
                 p.setRenderHint(QPainter::SmoothPixmapTransform, true);

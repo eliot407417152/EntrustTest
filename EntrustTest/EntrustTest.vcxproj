@@ -113,6 +113,7 @@
     <ClCompile Include="DesignerWindow.cpp" />
     <ClCompile Include="ElementItem.cpp" />
     <ClCompile Include="ExcelReader.cpp" />
+    <ClCompile Include="ImageMatcher.cpp" />
     <ClCompile Include="MainWindow.cpp" />
     <ClCompile Include="util.cpp">
       <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ConformanceMode>
@@ -137,6 +138,7 @@
     <ClInclude Include="DXP01SDK.h" />
     <ClInclude Include="ElementItem.h" />
     <ClInclude Include="ExcelReader.h" />
+    <ClInclude Include="ImageMatcher.h" />
     <ClInclude Include="Stdafx.h" />
     <ClInclude Include="util.h" />
     <QtMoc Include="MainWindow.h" />
