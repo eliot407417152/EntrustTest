@@ -1,4 +1,4 @@
-﻿// DesignerWindow: 卡面設計器主視窗 (階段 2：載入 Excel 製卡資料)。
+﻿// DesignerWindow: 卡面設計器主視窗 (階段 3：批次列印)。
 // 刻意不使用 Q_OBJECT：所有連線都用 lambda，所以不需要 moc 處理。
 #pragma once
 #include <QMainWindow>
@@ -66,6 +66,7 @@ private:
     void openLayout();
     void saveLayout();
     void exportPreview();
+    void openPrintDialog();                // 階段 3：批次列印
     void setOrientation(card::Orientation o);
 
     // 製卡資料 (階段 2)

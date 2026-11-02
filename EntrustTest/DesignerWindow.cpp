@@ -1,6 +1,7 @@
 ﻿#include "DesignerWindow.h"
 #include "CardPainter.h"
 #include "ElementItem.h"
+#include "PrintDialog.h"
 
 #include <QAction>
 #include <QActionGroup>
@@ -94,7 +95,7 @@ namespace {
 // ============================================================ construction ===
 
 DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle(tr("卡面設計器 (階段 2)"));
+    setWindowTitle(tr("卡面設計器 (階段 3)"));
     resize(1360, 840);
 
     // 預設版面：照片、姓名、學號、系所
@@ -249,6 +250,8 @@ void DesignerWindow::buildMenus() {
     actPrevRecord_ = newAction(this, tr("上一筆"), QKeySequence(Qt::ALT | Qt::Key_Left), tr("預覽上一筆資料 (Alt+←)"), [this] { stepRecord(-1); });
     actNextRecord_ = newAction(this, tr("下一筆"), QKeySequence(Qt::ALT | Qt::Key_Right), tr("預覽下一筆資料 (Alt+→)"), [this] { stepRecord(+1); });
 
+    auto* actPrint = newAction(this, tr("批次列印…"), QKeySequence::Print, tr("列印目前這一筆或整批資料 (Ctrl+P)"), [this] { openPrintDialog(); });
+
     auto* actFit = newAction(this, tr("符合視窗"), QKeySequence(Qt::CTRL | Qt::Key_0), tr("縮放到整張卡剛好放進視窗"), [this] { fitView(); });
     auto* actResetDocks = newAction(this, tr("還原預設面板配置"), QKeySequence(), tr("把所有面板重新開啟並放回預設位置"), [this] { resetDockLayout(); });
 
@@ -279,6 +282,9 @@ void DesignerWindow::buildMenus() {
     mData->addAction(actPrevRecord_);
     mData->addAction(actNextRecord_);
 
+    QMenu* mPrint = menuBar()->addMenu(tr("列印(&P)"));
+    mPrint->addAction(actPrint);
+
     QMenu* mView = menuBar()->addMenu(tr("檢視(&V)"));
     mView->addAction(actFit);
     mView->addSeparator();
@@ -302,6 +308,8 @@ void DesignerWindow::buildMenus() {
     tb->addAction(actLoadData);
     tb->addAction(actPrevRecord_);
     tb->addAction(actNextRecord_);
+    tb->addSeparator();
+    tb->addAction(actPrint);
     tb->addSeparator();
     tb->addAction(actFit);
 }
@@ -725,6 +733,40 @@ void DesignerWindow::exportPreview() {
         return;
     }
     statusBar()->showMessage(tr("已輸出 %1 (%2 x %3 px)").arg(path).arg(img.width()).arg(img.height()), 5000);
+}
+
+// ============================================================ 批次列印 (階段 3) ===
+
+void DesignerWindow::openPrintDialog() {
+    if (layout_.elements.isEmpty()) {
+        QMessageBox::information(this, tr("列印"), tr("版面是空的，請先新增元素。"));
+        return;
+    }
+
+    PrintInput in;
+    in.layout = layout_;
+    in.matcher = imageMatcher_;
+    in.matchField = matchField();
+
+    if (data_.rows.isEmpty()) {
+        // 還沒載入 Excel：用「預覽資料」欄位的內容印 1 張 (方便先用單張測試印表機與版面)
+        in.previewOnly = true;
+        in.data.fields = card::fieldNames();
+        card::Record rec;
+        for (const auto& pr : previewEdits_) rec.insert(pr.first, pr.second->text());
+        in.data.rows.append(rec);
+        in.currentRow = 0;
+        in.visibleRows = { 0 };
+    }
+    else {
+        in.data = data_;
+        in.currentRow = dataTable_->currentRow();
+        for (int r = 0; r < dataTable_->rowCount(); ++r)
+            if (!dataTable_->isRowHidden(r)) in.visibleRows.append(r);
+    }
+
+    PrintDialog dlg(in, this);
+    dlg.exec();
 }
 
 // ========================================================= 製卡資料 (階段 2) ===

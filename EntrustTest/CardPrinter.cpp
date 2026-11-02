@@ -123,7 +123,7 @@ namespace {
 
     // ------------------------------------------------------------------ drawing ---
 
-    void drawPage(HDC dc, int scale, const std::wstring& text, const std::wstring& imagePath) {
+    void drawPage(HDC dc, int scale, const std::wstring& text, const std::wstring& imagePath, bool fullPage) {
         if (!text.empty()) {
             if (!::TextOutW(dc, 75 * scale, 50 * scale, text.c_str(), (int)text.size()))
                 throw winError("TextOut", ::GetLastError());
@@ -132,6 +132,18 @@ namespace {
             CImage img;
             HRESULT hr = img.Load(imagePath.c_str());
             if (FAILED(hr)) throw winError("CImage::Load", hr);
+
+            if (fullPage) {
+                // 階段 3：圖片就是「整張卡面」(已依印表機 dpi 渲染)，直接拉滿整個可列印區域，不留邊界
+                const int pageW = ::GetDeviceCaps(dc, HORZRES);
+                const int pageH = ::GetDeviceCaps(dc, VERTRES);
+                if (pageW <= 0 || pageH <= 0) throw runtime_error("可列印區域太小");
+                ::SetStretchBltMode(dc, HALFTONE);
+                ::SetBrushOrgEx(dc, 0, 0, NULL);
+                if (!img.Draw(dc, 0, 0, pageW, pageH))
+                    throw winError("CImage::Draw", ::GetLastError());
+                return;
+            }
 
             // 縮放到可印區域內 (保持長寬比)
             const int margin = 50 * scale;
@@ -263,7 +275,7 @@ namespace {
         // 正面
         if (::StartPage(dc) <= 0) throw winError("StartPage(front)", ::GetLastError());
         if (o.magstripe) writeMagstripe(dc, o);
-        drawPage(dc, scale, o.frontText, o.frontImagePath);
+        drawPage(dc, scale, o.frontText, o.frontImagePath, o.fullPageImage);
         if (::EndPage(dc) <= 0) throw winError("EndPage(front)", ::GetLastError());
 
         // 背面
@@ -272,7 +284,7 @@ namespace {
             util::UpdateDevmode(printerHandle, printerName, devmode);
             if (!::ResetDC(dc, devmode)) throw winError("ResetDC", ::GetLastError());
             if (::StartPage(dc) <= 0) throw winError("StartPage(back)", ::GetLastError());
-            drawPage(dc, scale, o.backText, o.backImagePath);
+            drawPage(dc, scale, o.backText, o.backImagePath, o.fullPageImage);
             if (::EndPage(dc) <= 0) throw winError("EndPage(back)", ::GetLastError());
         }
 
@@ -317,6 +329,19 @@ std::wstring CardPrinter::queryStatus(const std::wstring& printerName, const Log
     s += L" | 解析度: " + std::wstring(po._monochromePrintResolution.GetString());
     s += L" | 驅動版本: " + std::wstring(driver.GetString());
     return s;
+}
+
+int CardPrinter::queryResolutionDpi(const std::wstring& printerName, const LogFn& log) {
+    CoutRedirect redirect(log);
+    ComInit com;
+    if (FAILED(com.hr)) throw winError("CoInitialize", com.hr);
+
+    const CString name(printerName.c_str());
+    CComPtr<IBidiSpl> bidiSpl = bindPrinter(name);
+    auto unbind = onExit([&] { if (bidiSpl) bidiSpl->UnbindDevice(); });
+
+    const auto po = util::ParsePrinterOptionsXML(util::GetPrinterOptionsXML(bidiSpl));
+    return (po._monochromePrintResolution == L"600x600") ? 600 : 300;   // 與 submitGdiJob 的判斷一致
 }
 
 void CardPrinter::print(const PrintOptions& o, const LogFn& log) {

@@ -22,6 +22,7 @@ struct PrintOptions {
     std::wstring backText;
     std::wstring frontImagePath;           // 空字串 = 不印圖
     std::wstring backImagePath;
+    bool fullPageImage = false;            // true = 圖片拉滿整張卡 (階段 3：已渲染好的整張卡面)；false = 沿用範例的邊界/縮放
 };
 
 class CardPrinter {
@@ -33,6 +34,10 @@ public:
 
     // 查詢印表機狀態 (簡短文字)；失敗時丟出 std::runtime_error
     static std::wstring queryStatus(const std::wstring& printerName, const LogFn& log);
+
+    // 查詢印表機解析度：600x600 機型回傳 600，其餘回傳 300。失敗時丟出 std::runtime_error
+    // (階段 3 用來決定「卡面要渲染成多少 dpi 的點陣圖」)
+    static int queryResolutionDpi(const std::wstring& printerName, const LogFn& log);
 
     // 送出列印工作；失敗時丟出 std::runtime_error
     // 注意：必須在「有自己 COM 套間的執行緒」呼叫 (函式內會 CoInitialize)。
