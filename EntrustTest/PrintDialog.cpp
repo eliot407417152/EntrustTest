@@ -151,6 +151,19 @@ void PrintDialog::buildUi() {
     rotateLabel_->setVisible(portrait);
     rotateCombo_->setVisible(portrait);
     rotateCombo_->setToolTip(tr("印表機進卡為橫向；直式卡面需旋轉後才能印。方向請先用一張測試卡確認。"));
+    topcoatCheck_ = new QCheckBox;
+    pf->addRow(topcoatCheck_);
+    if (in_.layout.topcoat.isDefault()) {
+        topcoatCheck_->setText(tr("鍍膜：版面未設定 (沿用驅動程式設定)"));
+        topcoatCheck_->setEnabled(false);
+    }
+    else {
+        QString what = QString::fromStdWString(topcoat::describeBase(card::toTopcoatSpec(in_.layout.topcoat)));
+        if (!in_.layout.topcoat.regions.isEmpty()) what += tr(" + %1 個額外範圍").arg(in_.layout.topcoat.regions.size());
+        topcoatCheck_->setText(tr("套用版面的鍍膜設定：%1").arg(what));
+        topcoatCheck_->setChecked(true);
+        topcoatCheck_->setToolTip(tr("取消勾選時，本次列印不送出任何鍍膜 PrintTicket / Escape，完全沿用驅動程式設定"));
+    }
     left->addWidget(printerBox_);
 
     dryBox_ = new QGroupBox(tr("測試模式"));
@@ -388,6 +401,7 @@ void PrintDialog::updateModeUi() {
     checkHopperCheck_->setEnabled(!dry);
     pollCheck_->setEnabled(!dry);
     rotateCombo_->setEnabled(!dry);
+    if (in_.layout.topcoat.isDefault() == false) topcoatCheck_->setEnabled(!dry);
     startBtn_->setText(dry ? tr("輸出圖片") : tr("開始列印"));
 }
 
@@ -594,6 +608,7 @@ void PrintDialog::startJob() {
     base.pollCompletion = pollCheck_->isChecked();
     base.magstripe = false;
     base.fullPageImage = true;
+    if (!dry) base.topcoat = topcoatForPrinter();             // 鍍膜 (階段 4)
     const bool continueOnError = continueCheck_->isChecked();
     const int dryDpi = dryDpiCombo_->currentText().toInt();
     const std::wstring printer = base.printerName;
@@ -824,6 +839,18 @@ void PrintDialog::logItem(int itemIndex, const QString& line) {
     log(QStringLiteral("  #%1 %2 | %3").arg(items_[itemIndex].row + 1).arg(rec.value(QStringLiteral("姓名")), line));
 }
 
+// 版面的鍍膜設定 → 印表機座標。直式卡面會先旋轉 90° 才送出，範圍必須用「同一個方向」換算。
+TopcoatSpec PrintDialog::topcoatForPrinter() const {
+    // 不用 isEnabled()：列印中整個群組會被停用，但設定仍然有效
+    if (in_.layout.topcoat.isDefault() || !topcoatCheck_->isChecked() || dryCheck_->isChecked()) return TopcoatSpec();
+    TopcoatSpec spec = card::toTopcoatSpec(in_.layout.topcoat);
+    if (in_.layout.orientation == card::Orientation::Portrait) {
+        const bool clockwise = rotateCombo_->currentIndex() == 0;       // 與 renderItem() 的影像旋轉方向一致
+        spec = topcoat::rotatePortraitToLandscape(spec, in_.layout.widthMm(), in_.layout.heightMm(), clockwise);
+    }
+    return spec;
+}
+
 QString PrintDialog::settingsSummary() const {
     QStringList l;
     l << tr("時間：%1").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
@@ -842,6 +869,9 @@ QString PrintDialog::settingsSummary() const {
     l << tr("卡面：%1 (%2 × %3 mm)；元素 %4 個")
         .arg(portrait ? tr("直式") : tr("橫式")).arg(in_.layout.widthMm(), 0, 'f', 1)
         .arg(in_.layout.heightMm(), 0, 'f', 1).arg(in_.layout.elements.size());
+    if (!dryCheck_->isChecked())
+        l << tr("鍍膜：%1").arg(topcoatForPrinter().isDefault() ? tr("不送出 (沿用驅動程式設定)")
+            : QString::fromStdWString(topcoat::describe(topcoatForPrinter())));
     l << tr("圖片比對：資料夾 %1；比對欄位 %2")
         .arg(in_.matcher.hasFolder() ? in_.matcher.folder() : tr("(未設定)"), in_.matchField);
     l << tr("略過有問題的資料：%1").arg(skipCheck_->isChecked() ? tr("是") : tr("否"));

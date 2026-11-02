@@ -75,6 +75,105 @@ namespace card {
         return e;
     }
 
+    // ------------------------------------------------------------------ 鍍膜 ---
+
+    namespace {
+        QString kindToStr(RegionKind k) {
+            switch (k) {
+            case RegionKind::Add: return QStringLiteral("add");
+            case RegionKind::Block: return QStringLiteral("block");
+            default: return QStringLiteral("remove");
+            }
+        }
+        RegionKind strToKind(const QString& s) {
+            if (s == QLatin1String("add")) return RegionKind::Add;
+            if (s == QLatin1String("block")) return RegionKind::Block;
+            return RegionKind::Remove;
+        }
+        QString baseToStr(TopcoatBase b) {
+            switch (b) {
+            case TopcoatBase::All: return QStringLiteral("all");
+            case TopcoatBase::Except: return QStringLiteral("except");
+            default: return QStringLiteral("driver");
+            }
+        }
+        TopcoatBase strToBase(const QString& s) {
+            if (s == QLatin1String("all")) return TopcoatBase::All;
+            if (s == QLatin1String("except")) return TopcoatBase::Except;
+            return TopcoatBase::DriverDefault;
+        }
+        QString excToStr(TopcoatException x) {
+            switch (x) {
+            case TopcoatException::MagJis: return QStringLiteral("magJis");
+            case TopcoatException::MagIso2: return QStringLiteral("magIso2");
+            case TopcoatException::MagIso3: return QStringLiteral("magIso3");
+            default: return QStringLiteral("chip7816");
+            }
+        }
+        TopcoatException strToExc(const QString& s) {
+            if (s == QLatin1String("magJis")) return TopcoatException::MagJis;
+            if (s == QLatin1String("magIso2")) return TopcoatException::MagIso2;
+            if (s == QLatin1String("magIso3")) return TopcoatException::MagIso3;
+            return TopcoatException::Chip7816;
+        }
+    }
+
+    QJsonObject TopcoatRegion::toJson() const {
+        QJsonObject o;
+        o["id"] = id;
+        o["kind"] = kindToStr(kind);
+        o["x"] = xMm; o["y"] = yMm; o["w"] = wMm; o["h"] = hMm;
+        return o;
+    }
+
+    TopcoatRegion TopcoatRegion::fromJson(const QJsonObject& o) {
+        TopcoatRegion r;
+        r.id = o.value("id").toString();
+        r.kind = strToKind(o.value("kind").toString());
+        r.xMm = o.value("x").toDouble(r.xMm);
+        r.yMm = o.value("y").toDouble(r.yMm);
+        r.wMm = qMax(0.5, o.value("w").toDouble(r.wMm));
+        r.hMm = qMax(0.5, o.value("h").toDouble(r.hMm));
+        return r;
+    }
+
+    TopcoatRegion* TopcoatSettings::find(const QString& id) {
+        for (auto& r : regions) if (r.id == id) return &r;
+        return nullptr;
+    }
+    const TopcoatRegion* TopcoatSettings::find(const QString& id) const {
+        for (const auto& r : regions) if (r.id == id) return &r;
+        return nullptr;
+    }
+    QString TopcoatSettings::nextId() const {
+        int maxN = 0;
+        for (const auto& r : regions)
+            if (r.id.startsWith(QLatin1String("r_"))) maxN = qMax(maxN, r.id.mid(2).toInt());
+        return QStringLiteral("r_%1").arg(maxN + 1);
+    }
+
+    QJsonObject TopcoatSettings::toJson() const {
+        QJsonObject o;
+        o["base"] = baseToStr(base);
+        o["exception"] = excToStr(exception);
+        QJsonArray arr;
+        for (const auto& r : regions) arr.append(r.toJson());
+        o["regions"] = arr;
+        return o;
+    }
+
+    TopcoatSettings TopcoatSettings::fromJson(const QJsonObject& o) {
+        TopcoatSettings t;
+        t.base = strToBase(o.value("base").toString());
+        t.exception = strToExc(o.value("exception").toString());
+        for (const auto& v : o.value("regions").toArray()) {
+            TopcoatRegion r = TopcoatRegion::fromJson(v.toObject());
+            if (r.id.isEmpty() || t.find(r.id)) r.id = t.nextId();
+            t.regions.append(r);
+        }
+        return t;
+    }
+
     // --------------------------------------------------------------- CardLayout ---
 
     double CardLayout::widthMm() const {
@@ -107,6 +206,7 @@ namespace card {
         QJsonArray arr;
         for (const auto& e : elements) arr.append(e.toJson());
         o["elements"] = arr;
+        if (!topcoat.isDefault()) o["topcoat"] = topcoat.toJson();       // 預設值不寫出，版面檔維持精簡
         return o;
     }
 
@@ -120,6 +220,7 @@ namespace card {
             if (e.id.isEmpty() || l.find(e.id)) e.id = l.nextId();   // 避免缺 id 或重複
             l.elements.append(e);
         }
+        l.topcoat = TopcoatSettings::fromJson(o.value("topcoat").toObject());   // 舊版面檔沒有 = 預設
         return l;
     }
 
@@ -147,6 +248,30 @@ namespace card {
         }
         *out = fromJson(doc.object());
         return true;
+    }
+
+    ::TopcoatSpec toTopcoatSpec(const TopcoatSettings& t) {
+        ::TopcoatSpec s;
+        switch (t.base) {
+        case TopcoatBase::All: s.base = ::TopcoatSpec::Base::All; break;
+        case TopcoatBase::Except: s.base = ::TopcoatSpec::Base::Except; break;
+        default: s.base = ::TopcoatSpec::Base::DriverDefault; break;
+        }
+        switch (t.exception) {
+        case TopcoatException::MagJis: s.exception = ::TopcoatSpec::Exception::MagJis; break;
+        case TopcoatException::MagIso2: s.exception = ::TopcoatSpec::Exception::MagIso2; break;
+        case TopcoatException::MagIso3: s.exception = ::TopcoatSpec::Exception::MagIso3; break;
+        default: s.exception = ::TopcoatSpec::Exception::Chip7816; break;
+        }
+        for (const auto& r : t.regions) {
+            const TopcoatRect rc{ r.yMm, r.xMm, r.wMm, r.hMm };          // 上 左 寬 高
+            switch (r.kind) {
+            case RegionKind::Add: s.addAreas.push_back(rc); break;
+            case RegionKind::Block: s.blockAreas.push_back(rc); break;
+            default: s.removeAreas.push_back(rc); break;
+            }
+        }
+        return s;
     }
 
     // --------------------------------------------------------------------- misc ---

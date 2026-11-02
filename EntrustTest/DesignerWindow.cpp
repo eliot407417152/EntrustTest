@@ -2,6 +2,7 @@
 #include "CardPainter.h"
 #include "ElementItem.h"
 #include "PrintDialog.h"
+#include "RegionItem.h"
 
 #include <QAction>
 #include <QActionGroup>
@@ -95,7 +96,7 @@ namespace {
 // ============================================================ construction ===
 
 DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle(tr("卡面設計器 (階段 3)"));
+    setWindowTitle(tr("卡面設計器 (階段 4)"));
     resize(1360, 840);
 
     // 預設版面：照片、姓名、學號、系所
@@ -188,6 +189,16 @@ void DesignerWindow::buildUi() {
         propertyDock_->setWidget(sa);
     }
 
+    topcoatDock_ = new QDockWidget(tr("鍍膜範圍"), this);
+    topcoatDock_->setObjectName(QStringLiteral("dockTopcoat"));
+    {
+        auto* sa = new QScrollArea;
+        sa->setWidgetResizable(true);
+        sa->setFrameShape(QFrame::NoFrame);
+        sa->setWidget(buildTopcoatPanel());
+        topcoatDock_->setWidget(sa);
+    }
+
     previewDock_ = new QDockWidget(tr("預覽資料"), this);
     previewDock_->setObjectName(QStringLiteral("dockPreview"));
     previewDock_->setWidget(buildPreviewPanel());
@@ -201,15 +212,18 @@ void DesignerWindow::buildUi() {
 
 // 面板配置：左=元素清單+製卡資料、右=屬性、下=預覽資料
 void DesignerWindow::resetDockLayout() {
-    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, previewDock_ }) {
+    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ }) {
         d->setFloating(false);
         removeDockWidget(d);
     }
     addDockWidget(Qt::LeftDockWidgetArea, elementDock_);
     splitDockWidget(elementDock_, dataDock_, Qt::Vertical);
     addDockWidget(Qt::RightDockWidgetArea, propertyDock_);
+    addDockWidget(Qt::RightDockWidgetArea, topcoatDock_);
+    tabifyDockWidget(propertyDock_, topcoatDock_);           // 「屬性」與「鍍膜範圍」疊成分頁
     addDockWidget(Qt::BottomDockWidgetArea, previewDock_);
-    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, previewDock_ }) d->show();
+    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ }) d->show();
+    propertyDock_->raise();
     applyDockSizes();
 }
 
@@ -236,6 +250,7 @@ void DesignerWindow::buildMenus() {
     actDelete_->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     view_->addAction(actDelete_);
     elementList_->addAction(actDelete_);
+    regionList_->addAction(actDelete_);      // 鍍膜範圍清單內按 Delete / Backspace 也能刪除範圍
 
     auto* orientGroup = new QActionGroup(this);
     actLandscape_ = orientGroup->addAction(tr("橫式 (85.6 × 54 mm)"));
@@ -287,9 +302,18 @@ void DesignerWindow::buildMenus() {
 
     QMenu* mView = menuBar()->addMenu(tr("檢視(&V)"));
     mView->addAction(actFit);
+    actShowRegions_ = newAction(this, tr("顯示鍍膜範圍"), QKeySequence(), tr("在卡面上顯示/隱藏鍍膜範圍 (只影響編輯畫面，不影響列印)"), nullptr);
+    actShowRegions_->setCheckable(true);
+    actShowRegions_->setChecked(true);
+    connect(actShowRegions_, &QAction::toggled, this, [this](bool on) {
+        if (!cardItem_) return;
+        for (QGraphicsItem* gi : cardItem_->childItems())
+            if (gi->type() == RegionItem::Type) gi->setVisible(on);
+        });
+    mView->addAction(actShowRegions_);
     mView->addSeparator();
     QMenu* mPanels = mView->addMenu(tr("面板"));
-    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, previewDock_ })
+    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ })
         mPanels->addAction(d->toggleViewAction());       // 面板被關掉後，從這裡重新開啟
     mView->addAction(actResetDocks);
 
@@ -315,7 +339,7 @@ void DesignerWindow::buildMenus() {
 }
 
 void DesignerWindow::updateActionStates() {
-    if (actDelete_) actDelete_->setEnabled(selectedItem() != nullptr);
+    if (actDelete_) actDelete_->setEnabled(selectedItem() != nullptr || selectedRegion() != nullptr || !currentRegionId().isEmpty());
     const bool hasData = !data_.rows.isEmpty();
     if (actPrevRecord_) actPrevRecord_->setEnabled(hasData);
     if (actNextRecord_) actNextRecord_->setEnabled(hasData);
@@ -613,6 +637,7 @@ void DesignerWindow::rebuildScene() {
     scene_->setSceneRect(QRectF(-60, -60, w + 120, h + 120));
 
     for (int i = 0; i < layout_.elements.size(); ++i) createItem(layout_.elements[i].id, i);
+    for (int i = 0; i < layout_.topcoat.regions.size(); ++i) createRegionItem(layout_.topcoat.regions[i].id, 10000 + i);   // 鍍膜範圍疊在最上層
 
     const bool portrait = layout_.orientation == card::Orientation::Portrait;
     actLandscape_->setChecked(!portrait);
@@ -621,6 +646,7 @@ void DesignerWindow::rebuildScene() {
 
     refreshList();
     populatePanel(nullptr);
+    refreshTopcoatPanel();
     updateActionStates();
     fitView();
 }
@@ -639,6 +665,12 @@ ElementItem* DesignerWindow::findItem(const QString& id) const {
 ElementItem* DesignerWindow::selectedItem() const {
     for (QGraphicsItem* gi : scene_->selectedItems())
         if (gi->type() == ElementItem::Type) return static_cast<ElementItem*>(gi);
+    return nullptr;
+}
+
+RegionItem* DesignerWindow::selectedRegion() const {
+    for (QGraphicsItem* gi : scene_->selectedItems())
+        if (gi->type() == RegionItem::Type) return static_cast<RegionItem*>(gi);
     return nullptr;
 }
 
@@ -675,6 +707,11 @@ void DesignerWindow::addElement(card::ElementType type) {
 }
 
 void DesignerWindow::deleteSelected() {
+    // 焦點在「鍍膜範圍」清單，或選取的是鍍膜範圍 (沒有選元素)：刪除範圍
+    if (regionList_->hasFocus() || (!selectedItem() && selectedRegion())) {
+        deleteSelectedRegion();
+        return;
+    }
     ElementItem* it = selectedItem();
     if (!it) return;
     const QString id = it->id();
@@ -990,6 +1027,280 @@ void DesignerWindow::updateDataInfo() {
     dataInfo_->setText(s);
 }
 
+// ============================================================ 鍍膜範圍 (階段 4) ===
+
+namespace {
+    QString regionLabel(const card::TopcoatRegion& r) {
+        return QStringLiteral("%1  (%2, %3)  %4 × %5 mm")
+            .arg(RegionItem::kindText(r.kind))
+            .arg(r.xMm, 0, 'f', 1).arg(r.yMm, 0, 'f', 1).arg(r.wMm, 0, 'f', 1).arg(r.hMm, 0, 'f', 1);
+    }
+}
+
+QWidget* DesignerWindow::buildTopcoatPanel() {
+    auto* w = new QWidget;
+    w->setMinimumWidth(300);
+    auto* root = new QVBoxLayout(w);
+
+    // --- 基本設定：PrintTicket ---
+    auto* baseBox = new QGroupBox(tr("基本設定 (PrintTicket)"));
+    auto* bf = new QFormLayout(baseBox);
+    topBaseCombo_ = new QComboBox;
+    topBaseCombo_->addItems({ tr("沿用驅動程式設定"), tr("全卡鍍膜"), tr("全卡鍍膜，但避開…") });
+    topExcCombo_ = new QComboBox;
+    topExcCombo_->addItems({ tr("晶片 (ISO 7816)"), tr("磁條 JIS"), tr("磁條 ISO 2 軌"), tr("磁條 ISO 3 軌") });
+    bf->addRow(tr("鍍膜"), topBaseCombo_);
+    bf->addRow(tr("避開"), topExcCombo_);
+    root->addWidget(baseBox);
+
+    // --- 額外範圍：Escape ---
+    auto* regBox = new QGroupBox(tr("額外範圍 (Escape)"));
+    auto* rl = new QVBoxLayout(regBox);
+    auto* hint = new QLabel(tr("鍍膜區：只在範圍內鍍膜 (其餘不鍍)\n移除鍍膜：範圍內不鍍膜\n列印阻擋：範圍內不列印\n"
+        "範圍可在卡面上拖曳，選取後拖右下角方塊調整大小 (座標以卡面左上角為原點，單位 mm)。"));
+    hint->setWordWrap(true);
+    hint->setStyleSheet(QStringLiteral("color:#666;"));
+    rl->addWidget(hint);
+
+    regionList_ = new QListWidget;
+    regionList_->setMinimumHeight(90);
+    rl->addWidget(regionList_);
+    auto* btnRow = new QHBoxLayout;
+    auto* addBtn = new QPushButton(tr("新增範圍"));
+    auto* delBtn = new QPushButton(tr("刪除範圍"));
+    btnRow->addWidget(addBtn);
+    btnRow->addWidget(delBtn);
+    btnRow->addStretch(1);
+    rl->addLayout(btnRow);
+
+    regionEditBox_ = new QGroupBox(tr("選取的範圍"));
+    auto* ef = new QFormLayout(regionEditBox_);
+    regionKindCombo_ = new QComboBox;
+    regionKindCombo_->addItems({ tr("鍍膜區"), tr("移除鍍膜"), tr("列印阻擋") });   // 順序 = RegionKind 的值
+    rxSpin_ = makeMmSpin(-100, 300);
+    rySpin_ = makeMmSpin(-100, 300);
+    rwSpin_ = makeMmSpin(0.5, 300);
+    rhSpin_ = makeMmSpin(0.5, 300);
+    ef->addRow(tr("種類"), regionKindCombo_);
+    ef->addRow(tr("X"), rxSpin_);
+    ef->addRow(tr("Y"), rySpin_);
+    ef->addRow(tr("寬"), rwSpin_);
+    ef->addRow(tr("高"), rhSpin_);
+    rl->addWidget(regionEditBox_);
+    root->addWidget(regBox);
+
+    // --- 將送出的指令 ---
+    root->addWidget(new QLabel(tr("將送給印表機的設定")));
+    topcoatPreview_ = new QPlainTextEdit;
+    topcoatPreview_->setReadOnly(true);
+    topcoatPreview_->setMaximumHeight(150);
+    topcoatPreview_->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    root->addWidget(topcoatPreview_);
+    root->addStretch(1);
+
+    // ---- 連線 ----
+    connect(topBaseCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_) return;
+        layout_.topcoat.base = static_cast<card::TopcoatBase>(i);
+        topExcCombo_->setEnabled(i == int(card::TopcoatBase::Except));
+        refreshTopcoatPreview();
+        });
+    connect(topExcCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_) return;
+        layout_.topcoat.exception = static_cast<card::TopcoatException>(i);
+        refreshTopcoatPreview();
+        });
+    connect(addBtn, &QPushButton::clicked, this, [this] { addRegion(); });
+    connect(delBtn, &QPushButton::clicked, this, [this] { deleteSelectedRegion(); });
+    connect(regionList_, &QListWidget::currentRowChanged, this, [this](int row) {
+        if (updating_) return;
+        const QString id = row >= 0 ? regionList_->item(row)->data(Qt::UserRole).toString() : QString();
+        populateRegionEditor(layout_.topcoat.find(id));
+        if (RegionItem* it = findRegionItem(id)) {
+            scene_->clearSelection();
+            it->setSelected(true);                 // 範圍被隱藏時無法選取，編輯欄位仍可使用
+        }
+        updateActionStates();
+        });
+    connect(regionKindCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        editSelectedRegion([&](card::TopcoatRegion& r) { r.kind = static_cast<card::RegionKind>(i); });
+        });
+    auto hook = [this](QDoubleSpinBox* sp, std::function<void(card::TopcoatRegion&, double)> fn) {
+        connect(sp, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, fn](double v) {
+            editSelectedRegion([&](card::TopcoatRegion& r) { fn(r, v); });
+            });
+        };
+    hook(rxSpin_, [](card::TopcoatRegion& r, double v) { r.xMm = v; });
+    hook(rySpin_, [](card::TopcoatRegion& r, double v) { r.yMm = v; });
+    hook(rwSpin_, [](card::TopcoatRegion& r, double v) { r.wMm = v; });
+    hook(rhSpin_, [](card::TopcoatRegion& r, double v) { r.hMm = v; });
+
+    populateRegionEditor(nullptr);
+    return w;
+}
+
+RegionItem* DesignerWindow::createRegionItem(const QString& id, int z) {
+    auto* it = new RegionItem(&layout_, id, [this](const QString& changedId) { onRegionItemChanged(changedId); }, cardItem_);
+    it->setZValue(z);
+    it->setVisible(actShowRegions_ ? actShowRegions_->isChecked() : true);
+    return it;
+}
+
+RegionItem* DesignerWindow::findRegionItem(const QString& id) const {
+    if (!cardItem_) return nullptr;
+    for (QGraphicsItem* gi : cardItem_->childItems()) {
+        if (gi->type() == RegionItem::Type) {
+            auto* it = static_cast<RegionItem*>(gi);
+            if (it->id() == id) return it;
+        }
+    }
+    return nullptr;
+}
+
+QString DesignerWindow::currentRegionId() const {
+    if (!regionList_ || !regionList_->currentItem()) return QString();
+    return regionList_->currentItem()->data(Qt::UserRole).toString();
+}
+
+void DesignerWindow::addRegion() {
+    card::TopcoatRegion r;
+    r.id = layout_.topcoat.nextId();
+    r.kind = card::RegionKind::Remove;
+    r.wMm = qMin(r.wMm, layout_.widthMm());
+    r.hMm = qMin(r.hMm, layout_.heightMm());
+    r.xMm = qMax(0.0, (layout_.widthMm() - r.wMm) / 2.0);
+    r.yMm = qMax(0.0, (layout_.heightMm() - r.hMm) / 2.0);
+    layout_.topcoat.regions.append(r);
+    createRegionItem(r.id, 10000 + int(layout_.topcoat.regions.size()));
+    refreshRegionList();
+    syncRegionListSelection(r.id);
+    populateRegionEditor(&layout_.topcoat.regions.last());
+    if (RegionItem* it = findRegionItem(r.id)) { scene_->clearSelection(); it->setSelected(true); }
+    refreshTopcoatPreview();
+    updateActionStates();
+}
+
+void DesignerWindow::deleteSelectedRegion() {
+    QString id;
+    if (RegionItem* it = selectedRegion()) id = it->id();
+    if (id.isEmpty()) id = currentRegionId();
+    if (id.isEmpty()) return;
+
+    updating_ = true;
+    if (RegionItem* it = findRegionItem(id)) delete it;
+    for (int i = 0; i < layout_.topcoat.regions.size(); ++i)
+        if (layout_.topcoat.regions[i].id == id) { layout_.topcoat.regions.removeAt(i); break; }
+    updating_ = false;
+
+    refreshRegionList();
+    populateRegionEditor(nullptr);
+    refreshTopcoatPreview();
+    updateActionStates();
+}
+
+void DesignerWindow::refreshTopcoatPanel() {
+    const bool prev = updating_;
+    updating_ = true;
+    topBaseCombo_->setCurrentIndex(int(layout_.topcoat.base));
+    topExcCombo_->setCurrentIndex(int(layout_.topcoat.exception));
+    topExcCombo_->setEnabled(layout_.topcoat.base == card::TopcoatBase::Except);
+    updating_ = prev;
+    refreshRegionList();
+    populateRegionEditor(nullptr);
+    refreshTopcoatPreview();
+}
+
+void DesignerWindow::refreshRegionList() {
+    const bool prev = updating_;
+    updating_ = true;
+    regionList_->clear();
+    for (const auto& r : layout_.topcoat.regions) {
+        auto* li = new QListWidgetItem(regionLabel(r));
+        li->setData(Qt::UserRole, r.id);
+        li->setForeground(RegionItem::kindColor(r.kind).darker(130));
+        regionList_->addItem(li);
+    }
+    updating_ = prev;
+}
+
+void DesignerWindow::refreshRegionListLabel(const card::TopcoatRegion& r) {
+    for (int i = 0; i < regionList_->count(); ++i) {
+        QListWidgetItem* li = regionList_->item(i);
+        if (li->data(Qt::UserRole).toString() == r.id) {
+            li->setText(regionLabel(r));
+            li->setForeground(RegionItem::kindColor(r.kind).darker(130));
+            break;
+        }
+    }
+}
+
+void DesignerWindow::syncRegionListSelection(const QString& id) {
+    const bool prev = updating_;
+    updating_ = true;
+    regionList_->setCurrentRow(-1);
+    for (int i = 0; i < regionList_->count(); ++i)
+        if (regionList_->item(i)->data(Qt::UserRole).toString() == id) { regionList_->setCurrentRow(i); break; }
+    updating_ = prev;
+}
+
+void DesignerWindow::populateRegionEditor(const card::TopcoatRegion* r) {
+    const bool prev = updating_;
+    updating_ = true;
+    regionEditBox_->setEnabled(r != nullptr);
+    if (r) {
+        regionKindCombo_->setCurrentIndex(int(r->kind));
+        rxSpin_->setValue(r->xMm);
+        rySpin_->setValue(r->yMm);
+        rwSpin_->setValue(r->wMm);
+        rhSpin_->setValue(r->hMm);
+    }
+    updating_ = prev;
+}
+
+void DesignerWindow::editSelectedRegion(const std::function<void(card::TopcoatRegion&)>& fn) {
+    if (updating_) return;
+    QString id;
+    if (RegionItem* it = selectedRegion()) id = it->id();
+    if (id.isEmpty()) id = currentRegionId();
+    card::TopcoatRegion* r = layout_.topcoat.find(id);
+    if (!r) return;
+    fn(*r);
+    if (RegionItem* it = findRegionItem(id)) { it->syncFromModel(); it->update(); }
+    refreshRegionListLabel(*r);
+    refreshTopcoatPreview();
+}
+
+void DesignerWindow::onRegionItemChanged(const QString& id) {
+    if (updating_) return;
+    if (const card::TopcoatRegion* r = layout_.topcoat.find(id)) {
+        refreshRegionListLabel(*r);
+        populateRegionEditor(r);               // 拖曳 / 縮放時同步更新數字
+    }
+    refreshTopcoatPreview();
+}
+
+void DesignerWindow::refreshTopcoatPreview() {
+    const ::TopcoatSpec spec = card::toTopcoatSpec(layout_.topcoat);
+    QString s;
+    if (spec.isDefault()) {
+        s = tr("不送出任何鍍膜設定 (完全沿用印表機驅動程式目前的設定)。");
+    }
+    else {
+        s += tr("PrintTicket：") + QString::fromStdWString(topcoat::describeBase(spec));
+        const auto esc = topcoat::escapes(spec);
+        if (esc.empty()) s += tr("\nEscape：(無)");
+        for (const auto& e : esc) s += QStringLiteral("\n") + QString::fromStdWString(e);
+    }
+    if (layout_.orientation == card::Orientation::Portrait && !spec.isDefault())
+        s += tr("\n\n直式卡面：以上為設計座標，列印時會依旋轉方向換算成橫式座標。");
+
+    bool outside = false;
+    for (const auto& r : layout_.topcoat.regions)
+        if (r.xMm < 0 || r.yMm < 0 || r.xMm + r.wMm > layout_.widthMm() + 0.01 || r.yMm + r.hMm > layout_.heightMm() + 0.01) outside = true;
+    if (outside) s += tr("\n\n⚠ 有範圍超出卡面。");
+    topcoatPreview_->setPlainText(s);
+}
+
 // ============================================================ panel / list ===
 
 void DesignerWindow::updateColorButton(const QColor& c) {
@@ -1065,8 +1376,20 @@ void DesignerWindow::syncListSelection(const QString& id) {
 void DesignerWindow::onSelectionChanged() {
     if (updating_) return;
     ElementItem* it = selectedItem();
+    RegionItem* rg = selectedRegion();
     syncListSelection(it ? it->id() : QString());
     populatePanel(it ? layout_.find(it->id()) : nullptr);
+    if (it && propertyDock_->isVisible()) propertyDock_->raise();
+    if (rg) {
+        syncRegionListSelection(rg->id());
+        populateRegionEditor(layout_.topcoat.find(rg->id()));
+        topcoatDock_->show();
+        topcoatDock_->raise();
+    }
+    else if (it) {
+        syncRegionListSelection(QString());
+        populateRegionEditor(nullptr);
+    }
     updateActionStates();
 }
 

@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "TopcoatSpec.h"
 
 struct PrintOptions {
     std::wstring printerName;
@@ -22,6 +23,7 @@ struct PrintOptions {
     std::wstring backText;
     std::wstring frontImagePath;           // 空字串 = 不印圖
     std::wstring backImagePath;
+    TopcoatSpec topcoat;                   // 鍍膜 (階段 4)：正面的 PrintTicket + Escape；預設 = 沿用驅動程式設定
     bool fullPageImage = false;            // true = 圖片拉滿整張卡 (階段 3：已渲染好的整張卡面)；false = 沿用範例的邊界/縮放
 };
 

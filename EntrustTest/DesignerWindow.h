@@ -1,4 +1,4 @@
-﻿// DesignerWindow: 卡面設計器主視窗 (階段 3：批次列印)。
+﻿// DesignerWindow: 卡面設計器主視窗 (階段 4：鍍膜範圍)。
 // 刻意不使用 Q_OBJECT：所有連線都用 lambda，所以不需要 moc 處理。
 #pragma once
 #include <QMainWindow>
@@ -28,6 +28,7 @@ class QPushButton;
 class QShowEvent;
 class QTableWidget;
 class ElementItem;
+class RegionItem;
 
 class DesignerWindow : public QMainWindow {
 public:
@@ -49,6 +50,7 @@ private:
     QWidget* buildPropertyPanel();
     QWidget* buildPreviewPanel();
     QWidget* buildDataPanel();
+    QWidget* buildTopcoatPanel();
     void resetDockLayout();
     void applyDockSizes();
     void updateActionStates();
@@ -68,6 +70,22 @@ private:
     void exportPreview();
     void openPrintDialog();                // 階段 3：批次列印
     void setOrientation(card::Orientation o);
+
+    // 鍍膜範圍 (階段 4)
+    RegionItem* createRegionItem(const QString& id, int z);
+    RegionItem* findRegionItem(const QString& id) const;
+    RegionItem* selectedRegion() const;
+    QString currentRegionId() const;
+    void addRegion();
+    void deleteSelectedRegion();
+    void refreshTopcoatPanel();                    // 依 layout_ 重新填入「鍍膜」面板
+    void refreshRegionList();
+    void refreshRegionListLabel(const card::TopcoatRegion& r);
+    void syncRegionListSelection(const QString& id);
+    void populateRegionEditor(const card::TopcoatRegion* r);
+    void editSelectedRegion(const std::function<void(card::TopcoatRegion&)>& fn);
+    void onRegionItemChanged(const QString& id);
+    void refreshTopcoatPreview();
 
     // 製卡資料 (階段 2)
     void browseData();
@@ -106,6 +124,7 @@ private:
     QDockWidget* dataDock_ = nullptr;
     QDockWidget* propertyDock_ = nullptr;
     QDockWidget* previewDock_ = nullptr;
+    QDockWidget* topcoatDock_ = nullptr;
 
     // 動作 (需要隨狀態啟用/停用的)
     QAction* actDelete_ = nullptr;
@@ -113,6 +132,7 @@ private:
     QAction* actNextRecord_ = nullptr;
     QAction* actLandscape_ = nullptr;
     QAction* actPortrait_ = nullptr;
+    QAction* actShowRegions_ = nullptr;
 
     QListWidget* elementList_ = nullptr;
 
@@ -136,6 +156,18 @@ private:
     QGroupBox* imageGroup_ = nullptr;
     QLineEdit* imageEdit_ = nullptr;
     QCheckBox* keepAspectCheck_ = nullptr;
+
+    // 鍍膜面板
+    QComboBox* topBaseCombo_ = nullptr;
+    QComboBox* topExcCombo_ = nullptr;
+    QListWidget* regionList_ = nullptr;
+    QGroupBox* regionEditBox_ = nullptr;
+    QComboBox* regionKindCombo_ = nullptr;
+    QDoubleSpinBox* rxSpin_ = nullptr;
+    QDoubleSpinBox* rySpin_ = nullptr;
+    QDoubleSpinBox* rwSpin_ = nullptr;
+    QDoubleSpinBox* rhSpin_ = nullptr;
+    QPlainTextEdit* topcoatPreview_ = nullptr;
 
     // 預覽資料
     QCheckBox* usePreviewCheck_ = nullptr;

@@ -116,6 +116,8 @@
     <ClCompile Include="ImageMatcher.cpp" />
     <ClCompile Include="MainWindow.cpp" />
     <ClCompile Include="PrintDialog.cpp" />
+    <ClCompile Include="RegionItem.cpp" />
+    <ClCompile Include="TopcoatSpec.cpp" />
     <ClCompile Include="util.cpp">
       <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ConformanceMode>
       <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">/Zc:strictStrings- %(AdditionalOptions)</AdditionalOptions>
@@ -141,7 +143,9 @@
     <ClInclude Include="ExcelReader.h" />
     <ClInclude Include="ImageMatcher.h" />
     <ClInclude Include="PrintDialog.h" />
+    <ClInclude Include="RegionItem.h" />
     <ClInclude Include="Stdafx.h" />
+    <ClInclude Include="TopcoatSpec.h" />
     <ClInclude Include="util.h" />
     <QtMoc Include="MainWindow.h" />
   </ItemGroup>

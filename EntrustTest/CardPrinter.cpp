@@ -14,6 +14,7 @@
 #include "DXP01SDK.H"
 #include "util.h"
 #include "CardPrinter.h"
+#include "TopcoatSpec.h"
 
 using std::runtime_error;
 using std::stringstream;
@@ -107,18 +108,31 @@ namespace {
 
     // ------------------------------------------------------------ print ticket ---
 
-    CString buildPrintTicketXml() {
-        // 與範例相同的 PrintTicket 命名空間；這裡只設定「不翻轉」，其餘沿用驅動程式目前設定。
-        // 想要頂膜/遮蔽區、停用列印等功能，可把 print/printTicketXml.h 內對應片段加進來。
-        return CString(
+    CString buildPrintTicketXml(const PrintOptions& o) {
+        // 與範例相同的 PrintTicket 命名空間：設定「不翻轉」，再疊上鍍膜的基本設定 (階段 4)；其餘沿用驅動程式目前設定。
+        // 鍍膜的額外範圍 (~TA / ~TR / ~PB) 是 Escape，不在 PrintTicket 內，見 writeTopcoatEscapes()。
+        CString xml(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
             "<psf:PrintTicket version=\"1\" "
             "xmlns:psf=\"http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework\" "
             "xmlns:psk=\"http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords\" "
             "xmlns:ns0000=\"http://schemas.datacard.com/2009/09/printing/XPS_Card_Printer\"> "
             "<psf:Feature name=\"ns0000:PageFlipFront\"><psf:Option name=\"ns0000:None\" /></psf:Feature>"
-            "<psf:Feature name=\"ns0000:PageFlipBack\"><psf:Option name=\"ns0000:None\" /></psf:Feature>"
-            "</psf:PrintTicket>");
+            "<psf:Feature name=\"ns0000:PageFlipBack\"><psf:Option name=\"ns0000:None\" /></psf:Feature>");
+        xml += CString(topcoat::frontTicketXml(o.topcoat).c_str());
+        xml += CString("</psf:PrintTicket>");
+        return xml;
+    }
+
+    // 鍍膜 / 列印阻擋 Escape：與範例相同，用 TextOut 送出 (內容只是指令，位置不重要)。
+    // 必須在該面的 StartPage ~ EndPage 之間送出；Escape 的優先權高於 PrintTicket。
+    void writeTopcoatEscapes(HDC dc, const PrintOptions& o) {
+        int n = 1;
+        for (const auto& e : topcoat::escapes(o.topcoat)) {
+            if (!::TextOutW(dc, 10 * n, 10 * n, e.c_str(), (int)e.size()))
+                throw winError("TextOut(topcoat escape)", ::GetLastError());
+            ++n;
+        }
     }
 
     // ------------------------------------------------------------------ drawing ---
@@ -208,7 +222,7 @@ namespace {
         if (FAILED(hr)) throw winError("ticketStream->Commit", hr);
 
         // 疊上卡片機專屬設定 (delta ticket)
-        const CStringA deltaXml((LPCSTR)CW2A(buildPrintTicketXml()));
+        const CStringA deltaXml((LPCSTR)CW2A(buildPrintTicketXml(o)));
         CComPtr<IStream> deltaStream;
         util::CreateIStream(deltaStream);
         ULONG written = 0;
@@ -276,6 +290,7 @@ namespace {
         if (::StartPage(dc) <= 0) throw winError("StartPage(front)", ::GetLastError());
         if (o.magstripe) writeMagstripe(dc, o);
         drawPage(dc, scale, o.frontText, o.frontImagePath, o.fullPageImage);
+        writeTopcoatEscapes(dc, o);
         if (::EndPage(dc) <= 0) throw winError("EndPage(front)", ::GetLastError());
 
         // 背面
@@ -327,6 +342,7 @@ std::wstring CardPrinter::queryStatus(const std::wstring& printerName, const Log
     s += L" | 印字頭: " + std::wstring(po._printHead.GetString());
     s += L" | 磁條: " + std::wstring(po._optionMagstripe.GetString());
     s += L" | 解析度: " + std::wstring(po._monochromePrintResolution.GetString());
+    s += L" | 鍍膜解析度: " + std::wstring(po._topcoatPrintResolution.IsEmpty() ? L"(未回報)" : po._topcoatPrintResolution.GetString());
     s += L" | 驅動版本: " + std::wstring(driver.GetString());
     return s;
 }
@@ -366,6 +382,11 @@ void CardPrinter::print(const PrintOptions& o, const LogFn& log) {
             throw runtime_error("印表機沒有安裝印字頭");
         if (o.magstripe && po._optionMagstripe.Find(L"ISO") == -1)
             throw runtime_error("印表機沒有 ISO 磁條模組");
+        if (!o.topcoat.isDefault()) {
+            say(log, L"鍍膜設定：" + topcoat::describe(o.topcoat));
+            if (po._topcoatPrintResolution.IsEmpty())
+                say(log, L"警告：印表機沒有回報鍍膜 (Topcoat) 解析度，鍍膜設定可能不會生效或被驅動程式拒絕");
+        }
 
         const CString hopperId = util::GetInputHopper(po._optionInputHopper, CString(o.hopperId.c_str()));
         if (o.checkHopper) {

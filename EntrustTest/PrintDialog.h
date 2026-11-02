@@ -92,6 +92,7 @@ private:
     void log(const QString& line);
     void logItem(int itemIndex, const QString& line);
     QString settingsSummary() const;
+    TopcoatSpec topcoatForPrinter() const;        // 版面的鍍膜設定 → 印表機 (橫式) 座標
 
     PrintInput in_;
     QSet<QString> usedFields_;                 // 版面中 {欄位} 用到的欄位
@@ -124,6 +125,7 @@ private:
     QCheckBox* continueCheck_ = nullptr;
     QLabel* rotateLabel_ = nullptr;
     QComboBox* rotateCombo_ = nullptr;
+    QCheckBox* topcoatCheck_ = nullptr;
     // 測試模式
     QGroupBox* dryBox_ = nullptr;
     QCheckBox* dryCheck_ = nullptr;
