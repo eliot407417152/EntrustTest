@@ -1,5 +1,6 @@
 ﻿#include "RegionItem.h"
 
+#include <QApplication>
 #include <QCursor>
 #include <QFont>
 #include <QGraphicsSceneHoverEvent>
@@ -48,9 +49,14 @@ QRectF RegionItem::contentRect() const {
     return r ? QRectF(0, 0, r->wMm * kPxPerMm, r->hMm * kPxPerMm) : QRectF();
 }
 
-QRectF RegionItem::handleRect() const {
-    const QRectF r = contentRect();
-    return QRectF(r.right() - 10, r.bottom() - 10, 10, 10);
+double RegionItem::handleSize() const {
+    return card::handleSizePx(card::viewScale(this), contentRect());
+}
+
+card::SnapContext RegionItem::snapContext() const {
+    card::SnapContext c = card::makeSnapContext(*layout_, id_, card::viewScale(this), kPxPerMm);
+    c.enabled = card::snapEnabledFlag() && !(QApplication::keyboardModifiers() & Qt::AltModifier);
+    return c;
 }
 
 QRectF RegionItem::boundingRect() const { return contentRect().adjusted(-2, -2, 2, 2); }
@@ -91,16 +97,27 @@ void RegionItem::paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) {
         p->setPen(sel);
         p->setBrush(Qt::NoBrush);
         p->drawRect(r);
-        p->setPen(Qt::NoPen);
-        p->setBrush(QColor(0, 120, 215));
-        p->drawRect(handleRect());
+        card::paintHandles(p, r, handleSize());
     }
     p->restore();
 }
 
 QVariant RegionItem::itemChange(GraphicsItemChange change, const QVariant& value) {
     if (change == ItemPositionChange && !syncing_) {
-        const QPointF pt = value.toPointF();
+        QPointF pt = value.toPointF();
+        const card::TopcoatRegion* reg = layout_->topcoat.find(id_);
+        const bool userDrag = reg && resizing_ == card::Handle::None && scene() && scene()->selectedItems().size() <= 1
+            && (QApplication::mouseButtons() & Qt::LeftButton);
+        if (userDrag) {
+            const card::SnapContext ctx = snapContext();
+            QRectF r(pt.x() / kPxPerMm, pt.y() / kPxPerMm, reg->wMm, reg->hMm);
+            bool sx = false, sy = false;
+            card::snapMoveRect(r, ctx, sx, sy);
+            std::vector<card::Guide> guides;
+            if (ctx.enabled) card::collectGuides(r, ctx, guides);
+            sendGuides(guides);
+            return QPointF(sx ? r.x() * kPxPerMm : qRound(pt.x()), sy ? r.y() * kPxPerMm : qRound(pt.y()));
+        }
         return QPointF(qRound(pt.x()), qRound(pt.y()));          // 以 0.1 mm 吸附
     }
     if (change == ItemPositionHasChanged && !syncing_) {
@@ -114,21 +131,31 @@ QVariant RegionItem::itemChange(GraphicsItemChange change, const QVariant& value
 }
 
 void RegionItem::mousePressEvent(QGraphicsSceneMouseEvent* ev) {
-    if (isSelected() && handleRect().contains(ev->pos())) {
-        resizing_ = true;
-        ev->accept();
-        return;
+    if (isSelected()) {
+        const card::Handle h = card::hitHandle(ev->pos(), contentRect(), handleSize());
+        if (h != card::Handle::None) {
+            if (const card::TopcoatRegion* r = layout_->topcoat.find(id_)) {
+                resizing_ = h;
+                origMm_ = QRectF(r->xMm, r->yMm, r->wMm, r->hMm);
+                ev->accept();
+                return;
+            }
+        }
     }
     QGraphicsItem::mousePressEvent(ev);
 }
 
 void RegionItem::mouseMoveEvent(QGraphicsSceneMouseEvent* ev) {
-    if (resizing_) {
+    if (resizing_ != card::Handle::None) {
         if (card::TopcoatRegion* r = layout_->topcoat.find(id_)) {
-            r->wMm = qMax(5.0, double(qRound(ev->pos().x()))) / kPxPerMm;    // 最小 0.5 mm
-            r->hMm = qMax(5.0, double(qRound(ev->pos().y()))) / kPxPerMm;
-            prepareGeometryChange();
-            update();
+            const QPointF inCard = parentItem() ? parentItem()->mapFromScene(ev->scenePos()) : ev->scenePos();
+            const card::SnapContext ctx = snapContext();
+            std::vector<card::Guide> guides;
+            const QRectF nr = card::dragResize(resizing_, origMm_, inCard / kPxPerMm, 0.5, 0.5,
+                ev->modifiers() & Qt::ShiftModifier, &ctx, &guides);
+            r->xMm = nr.x(); r->yMm = nr.y(); r->wMm = nr.width(); r->hMm = nr.height();
+            syncFromModel();
+            sendGuides(guides);
             if (onChanged_) onChanged_(id_);
         }
         ev->accept();
@@ -138,12 +165,13 @@ void RegionItem::mouseMoveEvent(QGraphicsSceneMouseEvent* ev) {
 }
 
 void RegionItem::mouseReleaseEvent(QGraphicsSceneMouseEvent* ev) {
-    resizing_ = false;
+    resizing_ = card::Handle::None;
+    sendGuides({});
     QGraphicsItem::mouseReleaseEvent(ev);
 }
 
 void RegionItem::hoverMoveEvent(QGraphicsSceneHoverEvent* ev) {
-    const bool onHandle = isSelected() && handleRect().contains(ev->pos());
-    setCursor(onHandle ? QCursor(Qt::SizeFDiagCursor) : QCursor(Qt::ArrowCursor));
+    const card::Handle h = isSelected() ? card::hitHandle(ev->pos(), contentRect(), handleSize()) : card::Handle::None;
+    setCursor(QCursor(card::handleCursor(h)));
     QGraphicsItem::hoverMoveEvent(ev);
 }

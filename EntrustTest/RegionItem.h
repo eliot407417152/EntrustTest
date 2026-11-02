@@ -4,6 +4,7 @@
 #include <QGraphicsItem>
 #include <functional>
 #include "CardLayout.h"
+#include "SnapGuides.h"
 
 class RegionItem : public QGraphicsItem {
 public:
@@ -17,6 +18,7 @@ public:
     int type() const override { return Type; }
     QString id() const { return id_; }
     void syncFromModel();
+    void setGuideSink(card::GuideSink fn) { guideSink_ = std::move(fn); }
 
     static QString kindText(card::RegionKind k);
     static QColor kindColor(card::RegionKind k);
@@ -34,11 +36,15 @@ protected:
 
 private:
     QRectF contentRect() const;
-    QRectF handleRect() const;
+    double handleSize() const;
+    card::SnapContext snapContext() const;
+    void sendGuides(const std::vector<card::Guide>& g) const { if (guideSink_) guideSink_(g); }
 
     card::CardLayout* layout_;
     QString id_;
     ChangedFn onChanged_;
     bool syncing_ = false;
-    bool resizing_ = false;
+    card::GuideSink guideSink_;
+    card::Handle resizing_ = card::Handle::None;
+    QRectF origMm_;
 };

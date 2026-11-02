@@ -4,6 +4,7 @@
 #include <QGraphicsItem>
 #include <functional>
 #include "CardLayout.h"
+#include "SnapGuides.h"
 
 class ElementItem : public QGraphicsItem {
 public:
@@ -21,6 +22,9 @@ public:
     // 模型 (mm) 改變後，呼叫它把圖形位置/大小更新過來
     void syncFromModel();
 
+    // 拖曳 / 縮放時，對齊輔助線要畫到哪裡 (由 DesignerWindow 設定)
+    void setGuideSink(card::GuideSink fn) { guideSink_ = std::move(fn); }
+
     QRectF boundingRect() const override;
     QPainterPath shape() const override;
     void paint(QPainter* painter, const QStyleOptionGraphicsItem* option, QWidget* widget) override;
@@ -34,12 +38,16 @@ protected:
 
 private:
     QRectF contentRect() const;
-    QRectF handleRect() const;
+    double handleSize() const;
+    card::SnapContext snapContext() const;
+    void sendGuides(const std::vector<card::Guide>& g) const { if (guideSink_) guideSink_(g); }
 
     card::CardLayout* layout_;
     const card::Record* rec_;
     QString id_;
     ChangedFn onChanged_;
     bool syncing_ = false;
-    bool resizing_ = false;
+    card::GuideSink guideSink_;
+    card::Handle resizing_ = card::Handle::None;   // 正在拖曳哪一個把手
+    QRectF origMm_;                                // 開始縮放時的範圍 (mm)
 };

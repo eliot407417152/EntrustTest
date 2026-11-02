@@ -19,6 +19,9 @@ class QFontComboBox;
 class QGraphicsRectItem;
 class QGraphicsScene;
 class QGraphicsView;
+class CardView;
+class RulerWidget;
+class GuideOverlay;
 class QGroupBox;
 class QLabel;
 class QLineEdit;
@@ -26,6 +29,7 @@ class QListWidget;
 class QPlainTextEdit;
 class QPushButton;
 class QShowEvent;
+class QTimer;
 class QTableWidget;
 class ElementItem;
 class RegionItem;
@@ -56,11 +60,21 @@ private:
     void updateActionStates();
 
     // 場景與模型同步
-    void rebuildScene();
+    void rebuildScene(bool refit = true);   // refit = false：保留目前的縮放與捲動位置 (復原/重做用)
     ElementItem* createItem(const QString& id, int z);
     ElementItem* findItem(const QString& id) const;
     ElementItem* selectedItem() const;
     void fitView();
+    void updateCursorLabel(const QPointF& scenePos, bool inside);   // 狀態列：卡面尺寸 + 游標位置 (mm)
+
+    // 復原 / 重做 (以版面快照實作，見 DesignerWindow.cpp 的「復原 / 重做」一節)
+    void commitUndo();                     // 版面與上次紀錄不同 -> 記成一個復原步驟
+    void scheduleCommit();                 // 連續編輯 (拖曳、輸入數字…) 停手後才記成一步
+    void undo();
+    void redo();
+    void restoreLayout(const card::CardLayout& l);
+    void updateUndoActions();
+    void updateRecordLabel();
 
     // 動作
     void addElement(card::ElementType type);
@@ -111,12 +125,24 @@ private:
     void updateColorButton(const QColor& c);
 
     card::CardLayout layout_;
+    // 復原 / 重做
+    std::vector<card::CardLayout> undoStack_;
+    std::vector<card::CardLayout> redoStack_;
+    card::CardLayout baseline_;            // 上一次記錄時的版面
+    QTimer* commitTimer_ = nullptr;
+    static constexpr size_t kMaxUndo = 100;
+
     card::Record previewRecord_;           // 場景內的元素都指向這個物件
     bool updating_ = false;                // 避免「程式更新控制項」又觸發「使用者編輯」
     bool shownOnce_ = false;
 
     QGraphicsScene* scene_ = nullptr;
-    QGraphicsView* view_ = nullptr;
+    CardView* view_ = nullptr;
+    RulerWidget* rulerH_ = nullptr;        // 卡面上方的 mm 尺規
+    RulerWidget* rulerV_ = nullptr;        // 卡面左方的 mm 尺規
+    GuideOverlay* guides_ = nullptr;       // 拖曳時的對齊輔助線
+    QLabel* recordLabel_ = nullptr;        // 工具列：「第 n / N 筆」
+    QLabel* cursorLabel_ = nullptr;        // 狀態列右側：卡面尺寸、游標位置
     QGraphicsRectItem* cardItem_ = nullptr;
 
     // 四個可開關的面板 (到「檢視」選單可重新開啟)
@@ -127,12 +153,15 @@ private:
     QDockWidget* topcoatDock_ = nullptr;
 
     // 動作 (需要隨狀態啟用/停用的)
+    QAction* actUndo_ = nullptr;
+    QAction* actRedo_ = nullptr;
     QAction* actDelete_ = nullptr;
     QAction* actPrevRecord_ = nullptr;
     QAction* actNextRecord_ = nullptr;
     QAction* actLandscape_ = nullptr;
     QAction* actPortrait_ = nullptr;
     QAction* actShowRegions_ = nullptr;
+    QAction* actSnap_ = nullptr;
 
     QListWidget* elementList_ = nullptr;
 

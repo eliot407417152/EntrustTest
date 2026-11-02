@@ -137,6 +137,7 @@
     <ClInclude Include="CardLayout.h" />
     <ClInclude Include="CardPainter.h" />
     <ClInclude Include="CardPrinter.h" />
+    <ClInclude Include="CardView.h" />
     <ClInclude Include="DesignerWindow.h" />
     <ClInclude Include="DXP01SDK.h" />
     <ClInclude Include="ElementItem.h" />
@@ -144,6 +145,7 @@
     <ClInclude Include="ImageMatcher.h" />
     <ClInclude Include="PrintDialog.h" />
     <ClInclude Include="RegionItem.h" />
+    <ClInclude Include="SnapGuides.h" />
     <ClInclude Include="Stdafx.h" />
     <ClInclude Include="TopcoatSpec.h" />
     <ClInclude Include="util.h" />

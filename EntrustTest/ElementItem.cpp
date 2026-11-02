@@ -1,6 +1,7 @@
 ﻿#include "ElementItem.h"
 #include "CardPainter.h"
 
+#include <QApplication>
 #include <QCursor>
 #include <QGraphicsSceneHoverEvent>
 #include <QGraphicsSceneMouseEvent>
@@ -31,9 +32,14 @@ QRectF ElementItem::contentRect() const {
     return e ? QRectF(0, 0, e->wMm * kPxPerMm, e->hMm * kPxPerMm) : QRectF();
 }
 
-QRectF ElementItem::handleRect() const {
-    const QRectF r = contentRect();
-    return QRectF(r.right() - 10, r.bottom() - 10, 10, 10);   // 右下角 (在元素內側)
+double ElementItem::handleSize() const {
+    return card::handleSizePx(card::viewScale(this), contentRect());
+}
+
+card::SnapContext ElementItem::snapContext() const {
+    card::SnapContext c = card::makeSnapContext(*layout_, id_, card::viewScale(this), kPxPerMm);
+    c.enabled = card::snapEnabledFlag() && !(QApplication::keyboardModifiers() & Qt::AltModifier);   // 按住 Alt = 暫時不吸附
+    return c;
 }
 
 QRectF ElementItem::boundingRect() const {
@@ -60,9 +66,7 @@ void ElementItem::paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) 
         p->setPen(pen);
         p->setBrush(Qt::NoBrush);
         p->drawRect(r);
-        p->setPen(Qt::NoPen);
-        p->setBrush(QColor(0, 120, 215));
-        p->drawRect(handleRect());
+        card::paintHandles(p, r, handleSize());          // 四個角 + 四個邊中點，共 8 個把手
     }
     else {
         QPen pen(QColor(190, 190, 190), 1, Qt::DotLine);   // 未選取時畫淡淡的邊界，方便看到範圍
@@ -76,8 +80,22 @@ void ElementItem::paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) 
 
 QVariant ElementItem::itemChange(GraphicsItemChange change, const QVariant& value) {
     if (change == ItemPositionChange && !syncing_) {
-        const QPointF pt = value.toPointF();
-        return QPointF(qRound(pt.x()), qRound(pt.y()));          // 以 0.1 mm 為單位吸附
+        QPointF pt = value.toPointF();
+        const card::Element* e = layout_->find(id_);
+        const bool userDrag = e && resizing_ == card::Handle::None && scene() && scene()->selectedItems().size() <= 1
+            && (QApplication::mouseButtons() & Qt::LeftButton);
+        if (userDrag) {
+            // 使用者拖曳中：貼齊其他元素 / 卡面的邊與中心線，並畫出輔助線
+            const card::SnapContext ctx = snapContext();
+            QRectF r(pt.x() / kPxPerMm, pt.y() / kPxPerMm, e->wMm, e->hMm);
+            bool sx = false, sy = false;
+            card::snapMoveRect(r, ctx, sx, sy);
+            std::vector<card::Guide> guides;
+            if (ctx.enabled) card::collectGuides(r, ctx, guides);
+            sendGuides(guides);
+            return QPointF(sx ? r.x() * kPxPerMm : qRound(pt.x()), sy ? r.y() * kPxPerMm : qRound(pt.y()));
+        }
+        return QPointF(qRound(pt.x()), qRound(pt.y()));          // 以 0.1 mm 為單位
     }
     if (change == ItemPositionHasChanged && !syncing_) {
         if (card::Element* e = layout_->find(id_)) {
@@ -90,23 +108,32 @@ QVariant ElementItem::itemChange(GraphicsItemChange change, const QVariant& valu
 }
 
 void ElementItem::mousePressEvent(QGraphicsSceneMouseEvent* ev) {
-    if (isSelected() && handleRect().contains(ev->pos())) {
-        resizing_ = true;
-        ev->accept();
-        return;
+    if (isSelected()) {
+        const card::Handle h = card::hitHandle(ev->pos(), contentRect(), handleSize());
+        if (h != card::Handle::None) {
+            if (const card::Element* e = layout_->find(id_)) {
+                resizing_ = h;
+                origMm_ = QRectF(e->xMm, e->yMm, e->wMm, e->hMm);
+                ev->accept();
+                return;
+            }
+        }
     }
     QGraphicsItem::mousePressEvent(ev);
 }
 
 void ElementItem::mouseMoveEvent(QGraphicsSceneMouseEvent* ev) {
-    if (resizing_) {
+    if (resizing_ != card::Handle::None) {
         if (card::Element* e = layout_->find(id_)) {
-            const double wPx = qMax(20.0, double(qRound(ev->pos().x())));   // 最小 2 mm
-            const double hPx = qMax(20.0, double(qRound(ev->pos().y())));
-            e->wMm = wPx / kPxPerMm;
-            e->hMm = hPx / kPxPerMm;
-            prepareGeometryChange();
-            update();
+            // 滑鼠在卡面上的位置 (mm)
+            const QPointF inCard = parentItem() ? parentItem()->mapFromScene(ev->scenePos()) : ev->scenePos();
+            const card::SnapContext ctx = snapContext();
+            std::vector<card::Guide> guides;
+            const QRectF nr = card::dragResize(resizing_, origMm_, inCard / kPxPerMm, 2.0, 2.0,
+                ev->modifiers() & Qt::ShiftModifier, &ctx, &guides);     // Shift：角落等比例縮放
+            e->xMm = nr.x(); e->yMm = nr.y(); e->wMm = nr.width(); e->hMm = nr.height();
+            syncFromModel();                 // 上 / 左邊拖曳時位置也會變
+            sendGuides(guides);
             if (onChanged_) onChanged_(id_);
         }
         ev->accept();
@@ -116,12 +143,13 @@ void ElementItem::mouseMoveEvent(QGraphicsSceneMouseEvent* ev) {
 }
 
 void ElementItem::mouseReleaseEvent(QGraphicsSceneMouseEvent* ev) {
-    resizing_ = false;
+    resizing_ = card::Handle::None;
+    sendGuides({});                          // 放開滑鼠後清掉輔助線
     QGraphicsItem::mouseReleaseEvent(ev);
 }
 
 void ElementItem::hoverMoveEvent(QGraphicsSceneHoverEvent* ev) {
-    const bool onHandle = isSelected() && handleRect().contains(ev->pos());
-    setCursor(onHandle ? QCursor(Qt::SizeFDiagCursor) : QCursor(Qt::ArrowCursor));
+    const card::Handle h = isSelected() ? card::hitHandle(ev->pos(), contentRect(), handleSize()) : card::Handle::None;
+    setCursor(QCursor(card::handleCursor(h)));
     QGraphicsItem::hoverMoveEvent(ev);
 }

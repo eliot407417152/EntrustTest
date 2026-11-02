@@ -1,5 +1,7 @@
 ﻿#include "DesignerWindow.h"
 #include "CardPainter.h"
+#include "CardView.h"
+#include "SnapGuides.h"
 #include "ElementItem.h"
 #include "PrintDialog.h"
 #include "RegionItem.h"
@@ -17,6 +19,7 @@
 #include <QFileInfo>
 #include <QFontComboBox>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsView>
@@ -25,6 +28,7 @@
 #include <QHash>
 #include <QHeaderView>
 #include <QLabel>
+#include <QSizePolicy>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
@@ -45,23 +49,6 @@
 #include <QWheelEvent>
 
 namespace {
-
-    // Ctrl + 滾輪縮放
-    class CardView : public QGraphicsView {
-    public:
-        using QGraphicsView::QGraphicsView;
-    protected:
-        void wheelEvent(QWheelEvent* e) override {
-            if (e->modifiers() & Qt::ControlModifier) {
-                const double f = e->angleDelta().y() > 0 ? 1.15 : 1.0 / 1.15;
-                scale(f, f);
-                e->accept();
-            }
-            else {
-                QGraphicsView::wheelEvent(e);
-            }
-        }
-    };
 
     QDoubleSpinBox* makeMmSpin(double minV, double maxV) {
         auto* s = new QDoubleSpinBox;
@@ -137,6 +124,8 @@ DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
     buildUi();
     applyPreviewRecord();
     rebuildScene();
+    baseline_ = layout_;                   // 復原的起點 = 剛建好的預設版面
+    updateUndoActions();
 }
 
 void DesignerWindow::showEvent(QShowEvent* ev) {
@@ -158,7 +147,42 @@ void DesignerWindow::buildUi() {
     view_->setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing | QPainter::SmoothPixmapTransform);
     view_->setBackgroundBrush(QColor(225, 225, 225));
     view_->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
-    setCentralWidget(view_);
+    view_->setFrameShape(QFrame::NoFrame);            // 沒有邊框，尺規的刻度才會和卡面對齊
+    view_->viewport()->setMouseTracking(true);        // 沒按滑鼠也要更新游標位置
+
+    // 卡面檢視 + 上方 / 左方 mm 尺規
+    rulerH_ = new RulerWidget(Qt::Horizontal, view_, ElementItem::kPxPerMm);
+    rulerV_ = new RulerWidget(Qt::Vertical, view_, ElementItem::kPxPerMm);
+    rulerH_->cardRect = rulerV_->cardRect = [this] { return cardItem_ ? cardItem_->sceneBoundingRect() : QRectF(); };
+    auto* corner = new QLabel(tr("mm"));
+    corner->setAlignment(Qt::AlignCenter);
+    corner->setFixedSize(RulerWidget::kThickness, RulerWidget::kThickness);
+    corner->setStyleSheet(QStringLiteral("background:#dedede; color:#555; font-size:9px; border-right:1px solid #a0a0a0; border-bottom:1px solid #a0a0a0;"));
+    auto* centerBox = new QWidget;
+    auto* grid = new QGridLayout(centerBox);
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setSpacing(0);
+    grid->addWidget(corner, 0, 0);
+    grid->addWidget(rulerH_, 0, 1);
+    grid->addWidget(rulerV_, 1, 0);
+    grid->addWidget(view_, 1, 1);
+    setCentralWidget(centerBox);
+
+    view_->onViewChanged = [this] { rulerH_->update(); rulerV_->update(); };
+    view_->onCursorMoved = [this](const QPointF& sp, bool inside) {
+        rulerH_->setCursorScenePos(sp, inside);
+        rulerV_->setCursorScenePos(sp, inside);
+        updateCursorLabel(sp, inside);
+        };
+
+    // 復原用的計時器：連續編輯停手 0.5 秒 (且滑鼠已放開) 才記成一個步驟
+    commitTimer_ = new QTimer(this);
+    commitTimer_->setSingleShot(true);
+    commitTimer_->setInterval(500);
+    connect(commitTimer_, &QTimer::timeout, this, [this] {
+        if (QApplication::mouseButtons() != Qt::NoButton) { commitTimer_->start(); return; }
+        commitUndo();
+        });
     connect(scene_, &QGraphicsScene::selectionChanged, this, [this] { onSelectionChanged(); });
 
     // ---- 面板 (都放進 QDockWidget，可由「檢視」選單重新開啟) ----
@@ -201,51 +225,68 @@ void DesignerWindow::buildUi() {
 
     previewDock_ = new QDockWidget(tr("預覽資料"), this);
     previewDock_->setObjectName(QStringLiteral("dockPreview"));
-    previewDock_->setWidget(buildPreviewPanel());
+    {
+        auto* sa = new QScrollArea;
+        sa->setWidgetResizable(true);
+        sa->setFrameShape(QFrame::NoFrame);
+        sa->setWidget(buildPreviewPanel());
+        previewDock_->setWidget(sa);
+    }
 
     resetDockLayout();
     buildMenus();
     updateActionStates();
 
-    statusBar()->showMessage(tr("Ctrl+滾輪縮放；拖曳元素移動；選取後拖曳右下角方塊調整大小；Delete / Backspace 刪除選取元素"));
+    cursorLabel_ = new QLabel;
+    cursorLabel_->setMinimumWidth(260);
+    cursorLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    statusBar()->addPermanentWidget(cursorLabel_);
+    updateCursorLabel(QPointF(), false);
+
+    statusBar()->showMessage(tr("Ctrl+滾輪縮放；拖曳元素移動；選取後拖曳右下角方塊調整大小；Delete 刪除；Ctrl+Z 復原；拖曳時會自動對齊 (按住 Alt 暫時停用)，Shift+拖曳角落等比例縮放"));
 }
 
-// 面板配置：左=元素清單+製卡資料、右=屬性、下=預覽資料
+// 面板配置：左=製卡資料；右(由上到下)=元素清單、屬性/鍍膜範圍(分頁)、預覽資料
 void DesignerWindow::resetDockLayout() {
     for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ }) {
         d->setFloating(false);
         removeDockWidget(d);
     }
-    addDockWidget(Qt::LeftDockWidgetArea, elementDock_);
-    splitDockWidget(elementDock_, dataDock_, Qt::Vertical);
-    addDockWidget(Qt::RightDockWidgetArea, propertyDock_);
-    addDockWidget(Qt::RightDockWidgetArea, topcoatDock_);
+    addDockWidget(Qt::LeftDockWidgetArea, dataDock_);
+
+    addDockWidget(Qt::RightDockWidgetArea, elementDock_);
+    splitDockWidget(elementDock_, propertyDock_, Qt::Vertical);
+    splitDockWidget(propertyDock_, previewDock_, Qt::Vertical);
     tabifyDockWidget(propertyDock_, topcoatDock_);           // 「屬性」與「鍍膜範圍」疊成分頁
-    addDockWidget(Qt::BottomDockWidgetArea, previewDock_);
+
     for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ }) d->show();
     propertyDock_->raise();
     applyDockSizes();
 }
 
 void DesignerWindow::applyDockSizes() {
-    resizeDocks({ elementDock_, dataDock_ }, { 190, 480 }, Qt::Vertical);
-    resizeDocks({ elementDock_, propertyDock_ }, { 390, 350 }, Qt::Horizontal);
+    resizeDocks({ elementDock_, propertyDock_, previewDock_ }, { 140, 390, 200 }, Qt::Vertical);
+    resizeDocks({ dataDock_, propertyDock_ }, { 430, 360 }, Qt::Horizontal);
 }
 
 // ---- 選單列 + 精簡工具列 ----
 void DesignerWindow::buildMenus() {
     // 動作
-    auto* actOpenLayout = newAction(this, tr("開啟版面…"), QKeySequence::Open, tr("開啟已儲存的版面檔 (.json)"), [this] { openLayout(); });
-    auto* actSaveLayout = newAction(this, tr("儲存版面…"), QKeySequence::Save, tr("把目前的版面存成 .json"), [this] { saveLayout(); });
+    auto* actOpenLayout = newAction(this, tr("開啟版面"), QKeySequence::Open, tr("開啟已儲存的版面檔 (.json)"), [this] { openLayout(); });
+    auto* actSaveLayout = newAction(this, tr("儲存版面"), QKeySequence::Save, tr("把目前的版面存成 .json"), [this] { saveLayout(); });
     auto* actExport = newAction(this, tr("輸出預覽圖 (300dpi)…"), QKeySequence(Qt::CTRL | Qt::Key_E), tr("把目前預覽的卡面輸出成 PNG"), [this] { exportPreview(); });
     auto* actQuit = newAction(this, tr("結束"), QKeySequence::Quit, QString(), [this] { close(); });
+
+    actUndo_ = newAction(this, tr("復原"), QKeySequence::Undo, tr("復原上一個動作 (Ctrl+Z)"), [this] { undo(); });
+    actRedo_ = newAction(this, tr("重做"), QKeySequence(), tr("重做 (Ctrl+Y / Ctrl+Shift+Z)"), [this] { redo(); });
+    actRedo_->setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_Y), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z) });
 
     auto* actAddText = newAction(this, tr("新增文字"), QKeySequence(Qt::CTRL | Qt::Key_T), tr("在卡面新增一個文字元素"), [this] { addElement(card::ElementType::Text); });
     auto* actAddImage = newAction(this, tr("新增圖片"), QKeySequence(Qt::CTRL | Qt::Key_I), tr("在卡面新增一個圖片元素"), [this] { addElement(card::ElementType::Image); });
 
     // 刪除：Delete 與 Backspace 都可以；只在焦點位於「卡面」或「元素清單」時生效，
     // 避免在屬性面板輸入文字、按倒退鍵時誤刪元素。
-    actDelete_ = newAction(this, tr("刪除元素"), QKeySequence(), tr("刪除選取的元素 (Delete / Backspace)"), [this] { deleteSelected(); });
+    actDelete_ = newAction(this, tr("刪除"), QKeySequence(), tr("刪除選取的元素 (Delete / Backspace)"), [this] { deleteSelected(); });
     actDelete_->setShortcuts({ QKeySequence(Qt::Key_Delete), QKeySequence(Qt::Key_Backspace) });
     actDelete_->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     view_->addAction(actDelete_);
@@ -261,11 +302,11 @@ void DesignerWindow::buildMenus() {
     connect(actLandscape_, &QAction::triggered, this, [this] { setOrientation(card::Orientation::Landscape); });
     connect(actPortrait_, &QAction::triggered, this, [this] { setOrientation(card::Orientation::Portrait); });
 
-    auto* actLoadData = newAction(this, tr("載入 Excel 製卡資料…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), tr("載入 .xlsx：姓名、學號、系所、內碼、外碼"), [this] { browseData(); });
-    actPrevRecord_ = newAction(this, tr("上一筆"), QKeySequence(Qt::ALT | Qt::Key_Left), tr("預覽上一筆資料 (Alt+←)"), [this] { stepRecord(-1); });
-    actNextRecord_ = newAction(this, tr("下一筆"), QKeySequence(Qt::ALT | Qt::Key_Right), tr("預覽下一筆資料 (Alt+→)"), [this] { stepRecord(+1); });
+    auto* actLoadData = newAction(this, tr("載入 Excel 資料"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), tr("載入 .xlsx：姓名、學號、系所、內碼、外碼"), [this] { browseData(); });
+    actPrevRecord_ = newAction(this, tr("◀ 上一筆"), QKeySequence(Qt::ALT | Qt::Key_Left), tr("預覽上一筆資料 (Alt+←)"), [this] { stepRecord(-1); });
+    actNextRecord_ = newAction(this, tr("下一筆 ▶"), QKeySequence(Qt::ALT | Qt::Key_Right), tr("預覽下一筆資料 (Alt+→)"), [this] { stepRecord(+1); });
 
-    auto* actPrint = newAction(this, tr("批次列印…"), QKeySequence::Print, tr("列印目前這一筆或整批資料 (Ctrl+P)"), [this] { openPrintDialog(); });
+    auto* actPrint = newAction(this, tr("列印…"), QKeySequence::Print, tr("列印目前這一筆或整批資料 (Ctrl+P)"), [this] { openPrintDialog(); });
 
     auto* actFit = newAction(this, tr("符合視窗"), QKeySequence(Qt::CTRL | Qt::Key_0), tr("縮放到整張卡剛好放進視窗"), [this] { fitView(); });
     auto* actResetDocks = newAction(this, tr("還原預設面板配置"), QKeySequence(), tr("把所有面板重新開啟並放回預設位置"), [this] { resetDockLayout(); });
@@ -277,11 +318,15 @@ void DesignerWindow::buildMenus() {
     mFile->addSeparator();
     mFile->addAction(actLoadData);
     mFile->addSeparator();
+    mFile->addAction(actPrint);
     mFile->addAction(actExport);
     mFile->addSeparator();
     mFile->addAction(actQuit);
 
     QMenu* mEdit = menuBar()->addMenu(tr("編輯(&E)"));
+    mEdit->addAction(actUndo_);
+    mEdit->addAction(actRedo_);
+    mEdit->addSeparator();
     mEdit->addAction(actAddText);
     mEdit->addAction(actAddImage);
     mEdit->addSeparator();
@@ -311,31 +356,92 @@ void DesignerWindow::buildMenus() {
             if (gi->type() == RegionItem::Type) gi->setVisible(on);
         });
     mView->addAction(actShowRegions_);
+    actSnap_ = newAction(this, tr("對齊輔助線"), QKeySequence(), tr("拖曳 / 縮放時自動貼齊其他元素與卡面的邊、中心線 (拖曳時按住 Alt 可暫時停用)"), nullptr);
+    actSnap_->setCheckable(true);
+    actSnap_->setChecked(true);
+    connect(actSnap_, &QAction::toggled, this, [](bool on) { card::snapEnabledFlag() = on; });
+    mView->addAction(actSnap_);
     mView->addSeparator();
     QMenu* mPanels = mView->addMenu(tr("面板"));
     for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ })
         mPanels->addAction(d->toggleViewAction());       // 面板被關掉後，從這裡重新開啟
     mView->addAction(actResetDocks);
 
-    // 工具列：只放最常用的，並用分隔線分組
-    QToolBar* tb = addToolBar(tr("常用"));
-    tb->setObjectName(QStringLiteral("toolbarMain"));
-    tb->setMovable(false);
-    tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
-    tb->addAction(actOpenLayout);
-    tb->addAction(actSaveLayout);
-    tb->addSeparator();
-    tb->addAction(actAddText);
-    tb->addAction(actAddImage);
-    tb->addAction(actDelete_);
-    tb->addSeparator();
-    tb->addAction(actLoadData);
-    tb->addAction(actPrevRecord_);
-    tb->addAction(actNextRecord_);
-    tb->addSeparator();
-    tb->addAction(actPrint);
-    tb->addSeparator();
-    tb->addAction(actFit);
+    // 工具列：依「使用流程」分成兩排
+    //   第 1 排 (檔案 / 資料 / 列印)：開啟 → 載入資料 → ……… → 列印 (靠右、醒目)
+    //   第 2 排 (設計)：復原重做 | 新增 / 刪除元素 | 檢視 | 預覽資料換筆
+    const QString tbStyle = QStringLiteral(
+        "QToolBar { spacing: 4px; padding: 3px; }"
+        "QToolButton { padding: 4px 10px; }");
+    auto caption = [this](const QString& text) {
+        auto* l = new QLabel(text);
+        l->setStyleSheet(QStringLiteral("color:#666; padding:0 4px 0 8px;"));
+        return l;
+        };
+
+    QToolBar* tb1 = new QToolBar(tr("檔案與列印"), this);
+    tb1->setObjectName(QStringLiteral("toolbarFile"));
+    tb1->setMovable(false);
+    tb1->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    tb1->setStyleSheet(tbStyle);
+    tb1->addWidget(caption(tr("版面")));
+    tb1->addAction(actOpenLayout);
+    tb1->addAction(actSaveLayout);
+    tb1->addSeparator();
+    tb1->addWidget(caption(tr("製卡資料")));
+    tb1->addAction(actLoadData);
+    auto* spacer = new QWidget;
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    tb1->addWidget(spacer);                                  // 把「列印」推到最右邊
+    tb1->addAction(actPrint);
+    if (QWidget* pb = tb1->widgetForAction(actPrint)) {
+        pb->setStyleSheet(QStringLiteral(
+            "QToolButton { background:#1f7a3d; color:white; font-weight:bold; font-size:13px;"
+            " padding:6px 22px; border-radius:4px; }"
+            "QToolButton:hover { background:#26994c; }"));
+    }
+    addToolBar(Qt::TopToolBarArea, tb1);
+
+    addToolBarBreak(Qt::TopToolBarArea);                     // 第 2 排
+
+    QToolBar* tb2 = new QToolBar(tr("設計"), this);
+    tb2->setObjectName(QStringLiteral("toolbarDesign"));
+    tb2->setMovable(false);
+    tb2->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    tb2->setStyleSheet(tbStyle);
+    tb2->addAction(actUndo_);
+    tb2->addAction(actRedo_);
+    tb2->addSeparator();
+    tb2->addWidget(caption(tr("元素")));
+    tb2->addAction(actAddText);
+    tb2->addAction(actAddImage);
+    tb2->addAction(actDelete_);
+    tb2->addSeparator();
+    tb2->addWidget(caption(tr("檢視")));
+    tb2->addAction(actFit);
+    tb2->addSeparator();
+    tb2->addWidget(caption(tr("預覽資料")));
+    tb2->addAction(actPrevRecord_);
+    recordLabel_ = new QLabel;
+    recordLabel_->setMinimumWidth(110);
+    recordLabel_->setAlignment(Qt::AlignCenter);
+    tb2->addWidget(recordLabel_);
+    tb2->addAction(actNextRecord_);
+    addToolBar(Qt::TopToolBarArea, tb2);
+
+    updateRecordLabel();
+    updateUndoActions();
+}
+
+void DesignerWindow::updateRecordLabel() {
+    if (!recordLabel_) return;
+    if (data_.rows.isEmpty()) {
+        recordLabel_->setText(tr("(範例資料)"));
+        return;
+    }
+    const int row = dataTable_ ? dataTable_->currentRow() : -1;
+    recordLabel_->setText(row >= 0 ? tr("第 %1 / %2 筆").arg(row + 1).arg(data_.rows.size())
+        : tr("共 %1 筆").arg(data_.rows.size()));
 }
 
 void DesignerWindow::updateActionStates() {
@@ -494,13 +600,14 @@ QWidget* DesignerWindow::buildPropertyPanel() {
 }
 
 QWidget* DesignerWindow::buildPreviewPanel() {
+    // 放在右側面板，所以欄位由上往下排
     auto* w = new QWidget;
-    auto* l = new QHBoxLayout(w);
+    auto* v = new QVBoxLayout(w);
 
     usePreviewCheck_ = new QCheckBox(tr("以此資料預覽"));
     usePreviewCheck_->setToolTip(tr("取消勾選時，動態欄位 {姓名} 等會直接顯示原樣"));
     usePreviewCheck_->setChecked(true);
-    l->addWidget(usePreviewCheck_);
+    v->addWidget(usePreviewCheck_);
 
     // 尚未載入 Excel 時的範例值；載入後，選取某一筆資料會把該筆資料填進這些欄位
     const QMap<QString, QString> samples{
@@ -509,14 +616,17 @@ QWidget* DesignerWindow::buildPreviewPanel() {
         { QStringLiteral("系所"), QStringLiteral("職業安全衛生系") },
         { QStringLiteral("內碼"), QStringLiteral("1234567890") },
         { QStringLiteral("外碼"), QStringLiteral("9876543210") } };
+    auto* form = new QFormLayout;
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     for (const QString& name : card::fieldNames()) {
         auto* edit = new QLineEdit(samples.value(name));
-        edit->setMinimumWidth(70);
-        l->addWidget(new QLabel(name + QStringLiteral("："), w));
-        l->addWidget(edit, 1);
+        form->addRow(name + QStringLiteral("："), edit);
         previewEdits_.emplace_back(name, edit);
         connect(edit, &QLineEdit::textChanged, this, [this] { applyPreviewRecord(); });
     }
+    v->addLayout(form);
+    v->addStretch(1);
+
     connect(usePreviewCheck_, &QCheckBox::toggled, this, [this] { applyPreviewRecord(); });
     return w;
 }
@@ -622,19 +732,23 @@ ElementItem* DesignerWindow::createItem(const QString& id, int z) {
     auto* it = new ElementItem(&layout_, &previewRecord_, id,
         [this](const QString& changedId) { onItemChanged(changedId); }, cardItem_);
     it->setZValue(z);
+    it->setGuideSink([this](const std::vector<card::Guide>& g) { if (guides_) guides_->setGuides(g); });
     return it;
 }
 
-void DesignerWindow::rebuildScene() {
+void DesignerWindow::rebuildScene(bool refit) {
     updating_ = true;
     scene_->clear();                       // 會刪除舊的卡片與所有元素
     cardItem_ = nullptr;
+    guides_ = nullptr;
 
     const double w = layout_.widthMm() * ElementItem::kPxPerMm;
     const double h = layout_.heightMm() * ElementItem::kPxPerMm;
     cardItem_ = scene_->addRect(0, 0, w, h, QPen(QColor(110, 110, 110)), QBrush(Qt::white));
     cardItem_->setFlag(QGraphicsItem::ItemClipsChildrenToShape, true);   // 超出卡片的部分不會被印出來
     scene_->setSceneRect(QRectF(-60, -60, w + 120, h + 120));
+    guides_ = new GuideOverlay(QRectF(0, 0, w, h), ElementItem::kPxPerMm);   // 輔助線圖層 (最上層)
+    scene_->addItem(guides_);
 
     for (int i = 0; i < layout_.elements.size(); ++i) createItem(layout_.elements[i].id, i);
     for (int i = 0; i < layout_.topcoat.regions.size(); ++i) createRegionItem(layout_.topcoat.regions[i].id, 10000 + i);   // 鍍膜範圍疊在最上層
@@ -648,7 +762,9 @@ void DesignerWindow::rebuildScene() {
     populatePanel(nullptr);
     refreshTopcoatPanel();
     updateActionStates();
-    fitView();
+    if (refit) fitView();
+    else if (view_->onViewChanged) view_->onViewChanged();
+    updateCursorLabel(QPointF(), false);
 }
 
 ElementItem* DesignerWindow::findItem(const QString& id) const {
@@ -678,11 +794,13 @@ void DesignerWindow::fitView() {
     if (!cardItem_) return;
     view_->resetTransform();
     view_->fitInView(cardItem_->sceneBoundingRect().adjusted(-25, -25, 25, 25), Qt::KeepAspectRatio);
+    if (view_->onViewChanged) view_->onViewChanged();      // 尺規跟著更新
 }
 
 // ================================================================= actions ===
 
 void DesignerWindow::addElement(card::ElementType type) {
+    commitUndo();                          // 先把還沒記錄的編輯收成一步
     card::Element e;
     e.id = layout_.nextId();
     e.type = type;
@@ -704,6 +822,7 @@ void DesignerWindow::addElement(card::ElementType type) {
 
     scene_->clearSelection();
     if (ElementItem* it = findItem(e.id)) it->setSelected(true);
+    commitUndo();
 }
 
 void DesignerWindow::deleteSelected() {
@@ -714,6 +833,7 @@ void DesignerWindow::deleteSelected() {
     }
     ElementItem* it = selectedItem();
     if (!it) return;
+    commitUndo();
     const QString id = it->id();
 
     updating_ = true;
@@ -726,12 +846,15 @@ void DesignerWindow::deleteSelected() {
     refreshList();
     populatePanel(nullptr);
     updateActionStates();
+    commitUndo();
 }
 
 void DesignerWindow::setOrientation(card::Orientation o) {
     if (layout_.orientation == o) return;
+    commitUndo();
     layout_.orientation = o;
     rebuildScene();                        // 元素座標維持不變，需要時請自行重新排版
+    commitUndo();
 }
 
 void DesignerWindow::openLayout() {
@@ -743,8 +866,10 @@ void DesignerWindow::openLayout() {
         QMessageBox::warning(this, tr("開啟失敗"), err);
         return;
     }
+    commitUndo();
     layout_ = loaded;
     rebuildScene();
+    commitUndo();                          // 開啟版面也可以用 Ctrl+Z 退回開啟前
     statusBar()->showMessage(tr("已開啟 %1").arg(path), 5000);
 }
 
@@ -855,6 +980,7 @@ bool DesignerWindow::loadData(const QString& path) {
     refreshImageMatches();
     updateDataInfo();
     updateActionStates();
+    updateRecordLabel();
     dataDock_->show();
     dataDock_->raise();
 
@@ -982,6 +1108,7 @@ void DesignerWindow::applyDataRow(int row) {
 
     usePreviewCheck_->setChecked(true);
     for (const auto& pr : previewEdits_) pr.second->setText(rec.value(pr.first));   // 每次變動都會自動重畫
+    updateRecordLabel();
     statusBar()->showMessage(tr("預覽第 %1 / %2 筆：%3")
         .arg(row + 1).arg(data_.rows.size()).arg(rec.value(QStringLiteral("姓名"))), 8000);
 }
@@ -1104,11 +1231,13 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
         layout_.topcoat.base = static_cast<card::TopcoatBase>(i);
         topExcCombo_->setEnabled(i == int(card::TopcoatBase::Except));
         refreshTopcoatPreview();
+        scheduleCommit();
         });
     connect(topExcCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
         if (updating_) return;
         layout_.topcoat.exception = static_cast<card::TopcoatException>(i);
         refreshTopcoatPreview();
+        scheduleCommit();
         });
     connect(addBtn, &QPushButton::clicked, this, [this] { addRegion(); });
     connect(delBtn, &QPushButton::clicked, this, [this] { deleteSelectedRegion(); });
@@ -1142,6 +1271,7 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
 RegionItem* DesignerWindow::createRegionItem(const QString& id, int z) {
     auto* it = new RegionItem(&layout_, id, [this](const QString& changedId) { onRegionItemChanged(changedId); }, cardItem_);
     it->setZValue(z);
+    it->setGuideSink([this](const std::vector<card::Guide>& g) { if (guides_) guides_->setGuides(g); });
     it->setVisible(actShowRegions_ ? actShowRegions_->isChecked() : true);
     return it;
 }
@@ -1163,6 +1293,7 @@ QString DesignerWindow::currentRegionId() const {
 }
 
 void DesignerWindow::addRegion() {
+    commitUndo();
     card::TopcoatRegion r;
     r.id = layout_.topcoat.nextId();
     r.kind = card::RegionKind::Remove;
@@ -1178,6 +1309,7 @@ void DesignerWindow::addRegion() {
     if (RegionItem* it = findRegionItem(r.id)) { scene_->clearSelection(); it->setSelected(true); }
     refreshTopcoatPreview();
     updateActionStates();
+    commitUndo();
 }
 
 void DesignerWindow::deleteSelectedRegion() {
@@ -1185,6 +1317,7 @@ void DesignerWindow::deleteSelectedRegion() {
     if (RegionItem* it = selectedRegion()) id = it->id();
     if (id.isEmpty()) id = currentRegionId();
     if (id.isEmpty()) return;
+    commitUndo();
 
     updating_ = true;
     if (RegionItem* it = findRegionItem(id)) delete it;
@@ -1196,6 +1329,7 @@ void DesignerWindow::deleteSelectedRegion() {
     populateRegionEditor(nullptr);
     refreshTopcoatPreview();
     updateActionStates();
+    commitUndo();
 }
 
 void DesignerWindow::refreshTopcoatPanel() {
@@ -1268,10 +1402,12 @@ void DesignerWindow::editSelectedRegion(const std::function<void(card::TopcoatRe
     if (RegionItem* it = findRegionItem(id)) { it->syncFromModel(); it->update(); }
     refreshRegionListLabel(*r);
     refreshTopcoatPreview();
+    scheduleCommit();
 }
 
 void DesignerWindow::onRegionItemChanged(const QString& id) {
     if (updating_) return;
+    scheduleCommit();
     if (const card::TopcoatRegion* r = layout_.topcoat.find(id)) {
         refreshRegionListLabel(*r);
         populateRegionEditor(r);               // 拖曳 / 縮放時同步更新數字
@@ -1395,6 +1531,7 @@ void DesignerWindow::onSelectionChanged() {
 
 void DesignerWindow::onItemChanged(const QString& id) {
     if (updating_) return;
+    scheduleCommit();
     ElementItem* it = selectedItem();
     if (it && it->id() == id) populatePanel(layout_.find(id));    // 拖曳/縮放時，同步更新面板數字
 }
@@ -1409,4 +1546,87 @@ void DesignerWindow::editSelected(const std::function<void(card::Element&)>& fn)
     it->syncFromModel();
     it->update();
     refreshListName(*e);
+    scheduleCommit();
+}
+
+// ============================================================ 游標位置 / 卡面尺寸 ===
+
+void DesignerWindow::updateCursorLabel(const QPointF& scenePos, bool inside) {
+    if (!cursorLabel_) return;
+    QString s = tr("卡面 %1 × %2 mm").arg(layout_.widthMm(), 0, 'f', 1).arg(layout_.heightMm(), 0, 'f', 1);
+    if (inside)
+        s += tr("　｜　游標 X %1  Y %2 mm")
+        .arg(scenePos.x() / ElementItem::kPxPerMm, 0, 'f', 1)
+        .arg(scenePos.y() / ElementItem::kPxPerMm, 0, 'f', 1);
+    cursorLabel_->setText(s);
+}
+
+// ============================================================ 復原 / 重做 ===
+// 做法：保留「上一次記錄時的整份版面」(baseline_)。每次操作結束後，若目前版面與 baseline_ 不同，
+// 就把 baseline_ 放進復原堆疊。
+//  - 新增 / 刪除 / 改方向 / 開啟版面：動作前後各 commitUndo() 一次，各自成為一步。
+//  - 拖曳、縮放、輸入數字、打字：每次變動只呼叫 scheduleCommit()，停手 0.5 秒 (且滑鼠已放開)
+//    才記成一步，所以一次拖曳 = 一步，不會變成幾百步。
+
+void DesignerWindow::commitUndo() {
+    if (commitTimer_) commitTimer_->stop();
+    if (layout_.toJson() == baseline_.toJson()) return;
+    undoStack_.push_back(baseline_);
+    if (undoStack_.size() > kMaxUndo) undoStack_.erase(undoStack_.begin());
+    redoStack_.clear();
+    baseline_ = layout_;
+    updateUndoActions();
+}
+
+void DesignerWindow::scheduleCommit() {
+    if (updating_ || !commitTimer_) return;
+    commitTimer_->start();                 // 重新計時
+    if (actUndo_) actUndo_->setEnabled(true);
+}
+
+void DesignerWindow::updateUndoActions() {
+    if (actUndo_) actUndo_->setEnabled(!undoStack_.empty());
+    if (actRedo_) actRedo_->setEnabled(!redoStack_.empty());
+}
+
+void DesignerWindow::undo() {
+    commitUndo();                          // 先把還沒記錄的編輯收成一步，Ctrl+Z 才會退回「剛剛那個動作」
+    if (undoStack_.empty()) return;
+    redoStack_.push_back(layout_);
+    const card::CardLayout prev = undoStack_.back();
+    undoStack_.pop_back();
+    restoreLayout(prev);
+    baseline_ = layout_;
+    updateUndoActions();
+    statusBar()->showMessage(tr("已復原 (還可復原 %1 步)").arg(undoStack_.size()), 3000);
+}
+
+void DesignerWindow::redo() {
+    commitUndo();
+    if (redoStack_.empty()) return;
+    undoStack_.push_back(layout_);
+    const card::CardLayout next = redoStack_.back();
+    redoStack_.pop_back();
+    restoreLayout(next);
+    baseline_ = layout_;
+    updateUndoActions();
+    statusBar()->showMessage(tr("已重做 (還可重做 %1 步)").arg(redoStack_.size()), 3000);
+}
+
+void DesignerWindow::restoreLayout(const card::CardLayout& l) {
+    // 記住目前選取的元素 / 範圍，還原後選回來
+    QString selElement, selRegion;
+    if (ElementItem* it = selectedItem()) selElement = it->id();
+    else if (RegionItem* rg = selectedRegion()) selRegion = rg->id();
+
+    const bool orientationChanged = l.orientation != layout_.orientation;
+    layout_ = l;
+    rebuildScene(orientationChanged);      // 沒換方向就不要重設縮放與捲動位置
+
+    if (!selElement.isEmpty()) {
+        if (ElementItem* it = findItem(selElement)) it->setSelected(true);
+    }
+    else if (!selRegion.isEmpty()) {
+        if (RegionItem* rg = findRegionItem(selRegion)) rg->setSelected(true);
+    }
 }
