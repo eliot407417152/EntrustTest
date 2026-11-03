@@ -39,6 +39,10 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
+#include <QCloseEvent>
+#include <QPointer>
+#include <QToolButton>
+#include "UiScale.h"
 #include <QSignalBlocker>
 #include <QShowEvent>
 #include <QStatusBar>
@@ -58,6 +62,20 @@ namespace {
         s->setSuffix(QStringLiteral(" mm"));
         return s;
     }
+
+    // 工具列樣式：寫死的像素尺寸依「介面大小」縮放
+    QString toolbarStyle() {
+        using uiscale::px;
+        return QStringLiteral("QToolBar { spacing: %1px; padding: %2px; } QToolButton { padding: %3px %4px; }")
+            .arg(px(4)).arg(px(3)).arg(px(4)).arg(px(10));
+    }
+    QString printButtonStyle() {
+        using uiscale::px;
+        return QStringLiteral("QToolButton { background:#1f7a3d; color:white; font-weight:bold; font-size:%1px;"
+            " padding:%2px %3px; border-radius:%4px; } QToolButton:hover { background:#26994c; }")
+            .arg(px(13)).arg(px(6)).arg(px(22)).arg(px(4));
+    }
+    constexpr int kWindowStateVersion = 1;
 
     QString typeText(const card::Element& e) {
         return e.type == card::ElementType::Text ? QStringLiteral("文字") : QStringLiteral("圖片");
@@ -84,7 +102,7 @@ namespace {
 
 DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(tr("卡面設計器 (階段 4)"));
-    resize(1360, 840);
+    uiscale::fitWindowToScreen(this, 1360, 840);     // 依螢幕可用範圍決定視窗大小 (不會超出螢幕)
 
     // 預設版面：照片、姓名、學號、系所
     layout_.orientation = card::Orientation::Landscape;
@@ -122,10 +140,37 @@ DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
     }
 
     buildUi();
+    migrateLegacyImageSettings(layout_);   // 舊版的全域圖片資料夾 / 比對欄位 -> 預設照片元素自己的設定
     applyPreviewRecord();
     rebuildScene();
     baseline_ = layout_;                   // 復原的起點 = 剛建好的預設版面
     updateUndoActions();
+
+    // 介面大小改變時 (選單 / 快捷鍵) 更新介面
+    uiscale::addListener([w = QPointer<DesignerWindow>(this)] { if (w) w->applyUiScale(); });
+
+    // 還原上次的視窗位置 / 大小 / 面板配置；換過螢幕或解析度時，保證視窗仍在螢幕內
+    {
+        QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));
+        const QByteArray g = st.value(QStringLiteral("window/geometry")).toByteArray();
+        const QByteArray s = st.value(QStringLiteral("window/state")).toByteArray();
+        if (!g.isEmpty()) restoreGeometry(g);
+        if (!s.isEmpty()) restoredState_ = restoreState(s, kWindowStateVersion);
+        uiscale::clampToScreen(this);
+    }
+}
+
+DesignerWindow::~DesignerWindow() {
+    // 視窗結束時，QGraphicsScene (QObject 子物件) 會在成員 (layout_ 等) 已經解構「之後」才被刪除，
+    // 刪除元素時它會發出 selectionChanged；先切斷連線，避免處理函式去存取已解構的成員。
+    if (scene_) scene_->disconnect(this);
+}
+
+void DesignerWindow::closeEvent(QCloseEvent* ev) {
+    QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));
+    st.setValue(QStringLiteral("window/geometry"), saveGeometry());
+    st.setValue(QStringLiteral("window/state"), saveState(kWindowStateVersion));
+    QMainWindow::closeEvent(ev);
 }
 
 void DesignerWindow::showEvent(QShowEvent* ev) {
@@ -134,7 +179,7 @@ void DesignerWindow::showEvent(QShowEvent* ev) {
         shownOnce_ = true;
         // 等視窗版面算好之後再調整面板大小與縮放
         QTimer::singleShot(0, this, [this] {
-            applyDockSizes();
+            if (!restoredState_) applyDockSizes();           // 有還原上次的面板配置就不要覆蓋
             fitView();
             });
     }
@@ -154,10 +199,10 @@ void DesignerWindow::buildUi() {
     rulerH_ = new RulerWidget(Qt::Horizontal, view_, ElementItem::kPxPerMm);
     rulerV_ = new RulerWidget(Qt::Vertical, view_, ElementItem::kPxPerMm);
     rulerH_->cardRect = rulerV_->cardRect = [this] { return cardItem_ ? cardItem_->sceneBoundingRect() : QRectF(); };
+    rulerV_->flipHeightMm = [this] { return layout_.heightMm(); };   // 原點在卡面左下角
     auto* corner = new QLabel(tr("mm"));
+    cornerLabel_ = corner;                  // 大小與字型在 applyUiScale() 設定
     corner->setAlignment(Qt::AlignCenter);
-    corner->setFixedSize(RulerWidget::kThickness, RulerWidget::kThickness);
-    corner->setStyleSheet(QStringLiteral("background:#dedede; color:#555; font-size:9px; border-right:1px solid #a0a0a0; border-bottom:1px solid #a0a0a0;"));
     auto* centerBox = new QWidget;
     auto* grid = new QGridLayout(centerBox);
     grid->setContentsMargins(0, 0, 0, 0);
@@ -238,12 +283,14 @@ void DesignerWindow::buildUi() {
     updateActionStates();
 
     cursorLabel_ = new QLabel;
-    cursorLabel_->setMinimumWidth(260);
+    cursorLabel_->setMinimumWidth(uiscale::px(260));
     cursorLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     statusBar()->addPermanentWidget(cursorLabel_);
     updateCursorLabel(QPointF(), false);
 
     statusBar()->showMessage(tr("Ctrl+滾輪縮放；拖曳元素移動；選取後拖曳右下角方塊調整大小；Delete 刪除；Ctrl+Z 復原；拖曳時會自動對齊 (按住 Alt 暫時停用)，Shift+拖曳角落等比例縮放"));
+
+    applyUiScale();                        // 依目前「介面大小」設定尺寸 (尺規、最小寬度、工具列…)
 }
 
 // 面板配置：左=製卡資料；右(由上到下)=元素清單、屬性/鍍膜範圍(分頁)、預覽資料
@@ -265,8 +312,9 @@ void DesignerWindow::resetDockLayout() {
 }
 
 void DesignerWindow::applyDockSizes() {
-    resizeDocks({ elementDock_, propertyDock_, previewDock_ }, { 140, 390, 200 }, Qt::Vertical);
-    resizeDocks({ dataDock_, propertyDock_ }, { 430, 360 }, Qt::Horizontal);
+    using uiscale::px;
+    resizeDocks({ elementDock_, propertyDock_, previewDock_ }, { px(140), px(390), px(200) }, Qt::Vertical);
+    resizeDocks({ dataDock_, propertyDock_ }, { px(430), px(360) }, Qt::Horizontal);
 }
 
 // ---- 選單列 + 精簡工具列 ----
@@ -367,12 +415,39 @@ void DesignerWindow::buildMenus() {
         mPanels->addAction(d->toggleViewAction());       // 面板被關掉後，從這裡重新開啟
     mView->addAction(actResetDocks);
 
+    // ---- 介面大小 / 視窗：不同電腦的螢幕解析度不同，可依需要調整 ----
+    mView->addSeparator();
+    QMenu* mScale = mView->addMenu(tr("介面大小"));
+    auto* scaleGroup = new QActionGroup(this);
+    auto addScale = [&](const QString& text, int percent) {
+        QAction* a = mScale->addAction(text);
+        a->setCheckable(true);
+        a->setData(percent);
+        scaleGroup->addAction(a);
+        scaleActs_.push_back(a);
+        connect(a, &QAction::triggered, this, [percent] { uiscale::setStored(percent); });
+        };
+    addScale(tr("自動 (依螢幕大小)"), 0);
+    for (int p : uiscale::kPresets) addScale(QStringLiteral("%1%").arg(p), p);
+    mScale->addSeparator();
+    auto* actBigger = newAction(this, tr("放大介面"), QKeySequence(), tr("介面放大一級 (Ctrl+Shift++)"), [] { uiscale::step(+1); });
+    actBigger->setShortcuts({ QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Plus), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Equal) });
+    auto* actSmaller = newAction(this, tr("縮小介面"), QKeySequence(), tr("介面縮小一級 (Ctrl+Shift+-)"), [] { uiscale::step(-1); });
+    actSmaller->setShortcuts({ QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Minus), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Underscore) });
+    auto* actScaleReset = newAction(this, tr("介面還原 100%"), QKeySequence(), tr("介面大小還原為 100% (Ctrl+Shift+0)"), [] { uiscale::setStored(100); });
+    actScaleReset->setShortcuts({ QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_0), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_ParenRight) });
+    mScale->addAction(actBigger);
+    mScale->addAction(actSmaller);
+    mScale->addAction(actScaleReset);
+    auto* actFitWindow = newAction(this, tr("視窗適應螢幕"), QKeySequence(), tr("把視窗調成適合目前螢幕的大小並置中，同時還原面板配置 (視窗跑出螢幕或面板被擠壞時使用)"), [this] { fitWindowToScreen(); });
+    mView->addAction(actFitWindow);
+    auto* actFull = newAction(this, tr("全螢幕"), QKeySequence(Qt::Key_F11), tr("切換全螢幕 (F11)"), [this] { if (isFullScreen()) showNormal(); else showFullScreen(); });
+    mView->addAction(actFull);
+
     // 工具列：依「使用流程」分成兩排
     //   第 1 排 (檔案 / 資料 / 列印)：開啟 → 載入資料 → ……… → 列印 (靠右、醒目)
     //   第 2 排 (設計)：復原重做 | 新增 / 刪除元素 | 檢視 | 預覽資料換筆
-    const QString tbStyle = QStringLiteral(
-        "QToolBar { spacing: 4px; padding: 3px; }"
-        "QToolButton { padding: 4px 10px; }");
+    const QString tbStyle = toolbarStyle();
     auto caption = [this](const QString& text) {
         auto* l = new QLabel(text);
         l->setStyleSheet(QStringLiteral("color:#666; padding:0 4px 0 8px;"));
@@ -395,10 +470,8 @@ void DesignerWindow::buildMenus() {
     tb1->addWidget(spacer);                                  // 把「列印」推到最右邊
     tb1->addAction(actPrint);
     if (QWidget* pb = tb1->widgetForAction(actPrint)) {
-        pb->setStyleSheet(QStringLiteral(
-            "QToolButton { background:#1f7a3d; color:white; font-weight:bold; font-size:13px;"
-            " padding:6px 22px; border-radius:4px; }"
-            "QToolButton:hover { background:#26994c; }"));
+        pb->setObjectName(QStringLiteral("btnPrint"));
+        pb->setStyleSheet(printButtonStyle());
     }
     addToolBar(Qt::TopToolBarArea, tb1);
 
@@ -423,7 +496,7 @@ void DesignerWindow::buildMenus() {
     tb2->addWidget(caption(tr("預覽資料")));
     tb2->addAction(actPrevRecord_);
     recordLabel_ = new QLabel;
-    recordLabel_->setMinimumWidth(110);
+    recordLabel_->setMinimumWidth(uiscale::px(110));
     recordLabel_->setAlignment(Qt::AlignCenter);
     tb2->addWidget(recordLabel_);
     tb2->addAction(actNextRecord_);
@@ -453,7 +526,7 @@ void DesignerWindow::updateActionStates() {
 
 QWidget* DesignerWindow::buildPropertyPanel() {
     propertyPanel_ = new QWidget;
-    propertyPanel_->setMinimumWidth(300);
+    propertyPanel_->setMinimumWidth(uiscale::px(300));
     auto* root = new QVBoxLayout(propertyPanel_);
 
     // --- 基本 ---
@@ -468,15 +541,23 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     basic->addRow(tr("類型"), typeLabel_);
     basic->addRow(tr("X"), xSpin_);
     basic->addRow(tr("Y"), ySpin_);
+    xSpin_->setToolTip(tr("元素左下角到卡面左邊的距離 (原點 = 卡面左下角)"));
+    ySpin_->setToolTip(tr("元素左下角到卡面底邊的距離，往上增加 (原點 = 卡面左下角)"));
+    hSpin_->setToolTip(tr("修改高度時，元素的底邊位置不變，往上長高 / 縮短"));
     basic->addRow(tr("寬"), wSpin_);
     basic->addRow(tr("高"), hSpin_);
+    fitCheck_ = new QCheckBox;
+    fitCheck_->setToolTip(tr("文字：框的寬、高自動等於文字的實際大小 (不換行)，X / Y 即為文字的位置。\n"
+        "圖片：寬度不變，高度依圖片長寬比自動調整 (底邊不動，往上長高)。\n"
+        "內容隨每一筆資料改變時，預覽與列印都會逐筆重新貼合；靠左 / 置中 / 靠右會分別固定左邊 / 中心 / 右邊。"));
+    basic->addRow(fitCheck_);
     root->addLayout(basic);
 
     // --- 文字 ---
     textGroup_ = new QGroupBox(tr("文字"));
     auto* tf = new QFormLayout(textGroup_);
     textEdit_ = new QPlainTextEdit;
-    textEdit_->setFixedHeight(64);
+    textEdit_->setFixedHeight(uiscale::px(64));
     textEdit_->setPlaceholderText(tr("固定文字，或用 {姓名} 這類欄位當動態內容"));
     tf->addRow(textEdit_);
 
@@ -513,22 +594,95 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     tf->addRow(tr("顏色"), colorBtn_);
     root->addWidget(textGroup_);
 
-    // --- 圖片 ---
+    // --- 圖片：每個圖片元素各自一組設定 (固定 / 動態)，不同的圖片可以用不同的資料夾與比對欄位 ---
     imageGroup_ = new QGroupBox(tr("圖片"));
     auto* imf = new QFormLayout(imageGroup_);
-    imageEdit_ = new QLineEdit;
-    imageEdit_->setPlaceholderText(tr("留空 = 依「圖片資料夾」自動比對；或填固定路徑 / 含 {欄位} 的路徑"));
-    imageEdit_->setToolTip(tr("留空：依「製卡資料」面板設定的圖片資料夾與比對欄位，自動帶入對應照片\n"
-        "填路徑：固定使用該圖片 (例如公司 Logo)，或用 {學號} 這類欄位組出路徑，例如 D:\\photos\\{學號}.jpg"));
+    imageSourceCombo_ = new QComboBox;
+    imageSourceCombo_->addItem(tr("固定圖片 (每張卡都用同一張)"));
+    imageSourceCombo_->addItem(tr("動態圖片 (依每一筆資料帶入)"));
+    imageSourceCombo_->setToolTip(tr("固定：例如公司 Logo，每張卡都一樣。\n動態：例如照片，依每一筆資料的某個欄位 (學號、姓名…) 到資料夾找對應的檔案。"));
+    imf->addRow(tr("來源"), imageSourceCombo_);
+
+    // 固定圖片
+    imageFixedBox_ = new QWidget;
     auto* browse = new QPushButton(tr("選擇…"));
-    auto* pathRow = new QWidget;
-    auto* pl = new QHBoxLayout(pathRow);
-    pl->setContentsMargins(0, 0, 0, 0);
-    pl->addWidget(imageEdit_, 1);
-    pl->addWidget(browse);
-    imf->addRow(tr("路徑"), pathRow);
-    keepAspectCheck_ = new QCheckBox(tr("保持長寬比"));
-    imf->addRow(keepAspectCheck_);
+    {
+        auto* fl = new QFormLayout(imageFixedBox_);
+        fl->setContentsMargins(0, 0, 0, 0);
+        imageEdit_ = new QLineEdit;
+        imageEdit_->setPlaceholderText(tr("圖片檔路徑"));
+        imageEdit_->setToolTip(tr("固定使用這張圖片 (例如公司 Logo)。\n路徑也可以含 {欄位}，例如 D:\\photos\\{學號}.jpg。"));
+        auto* pathRow = new QWidget;
+        auto* pl = new QHBoxLayout(pathRow);
+        pl->setContentsMargins(0, 0, 0, 0);
+        pl->addWidget(imageEdit_, 1);
+        pl->addWidget(browse);
+        fl->addRow(tr("路徑"), pathRow);
+    }
+    imf->addRow(imageFixedBox_);
+
+    // 動態圖片
+    imageDynBox_ = new QWidget;
+    auto* folderBtn = new QPushButton(tr("選擇…"));
+    auto* rescanBtn = new QPushButton(tr("重新掃描"));
+    {
+        auto* dl = new QFormLayout(imageDynBox_);
+        dl->setContentsMargins(0, 0, 0, 0);
+        imageFolderEdit_ = new QLineEdit;
+        imageFolderEdit_->setPlaceholderText(tr("圖片資料夾路徑"));
+        auto* folderRow = new QWidget;
+        auto* fr = new QHBoxLayout(folderRow);
+        fr->setContentsMargins(0, 0, 0, 0);
+        fr->addWidget(imageFolderEdit_, 1);
+        fr->addWidget(folderBtn);
+        dl->addRow(tr("資料夾"), folderRow);
+
+        matchFieldCombo_ = new QComboBox;
+        matchFieldCombo_->addItems(card::fieldNames());
+        matchFieldCombo_->setToolTip(tr("用這個欄位的值，去找「檔名等於 / 包含該值」的圖片"));
+        rescanBtn->setToolTip(tr("資料夾內的圖片有增減時按這裡"));
+        auto* matchRow = new QWidget;
+        auto* mr = new QHBoxLayout(matchRow);
+        mr->setContentsMargins(0, 0, 0, 0);
+        mr->addWidget(matchFieldCombo_, 1);
+        mr->addWidget(rescanBtn);
+        dl->addRow(tr("比對欄位"), matchRow);
+
+        imageSummary_ = new QLabel;
+        imageSummary_->setWordWrap(true);
+        dl->addRow(imageSummary_);
+    }
+    imf->addRow(imageDynBox_);
+
+    // 尺寸處理：框的大小自己決定，圖片依下面的方式放進框裡
+    imageFitCombo_ = new QComboBox;
+    imageFitCombo_->addItem(tr("裁切填滿 (蓋滿框，超出的裁掉)"));
+    imageFitCombo_->addItem(tr("縮放適應 (整張放進框，可能留白)"));
+    imageFitCombo_->addItem(tr("拉伸 (填滿框，比例會改變)"));
+    imageFitCombo_->addItem(tr("框高依圖片比例 (寬度不變，自動算高度)"));
+    imageFitCombo_->setToolTip(tr("框的寬、高可以自己設定，圖片依這裡的方式放進框裡。\n"
+        "裁切填滿：維持比例放大到蓋滿框，超出的部分裁掉 (適合證件照)。\n"
+        "縮放適應：維持比例縮到整張放進框裡。\n拉伸：直接拉成框的大小。\n"
+        "框高依圖片比例：框的高度自動跟著圖片比例，這時高度不能手動改。"));
+    imf->addRow(tr("顯示方式"), imageFitCombo_);
+    auto makePctSpin = [](double lo, double hi, double step, double v) {
+        auto* s = new QDoubleSpinBox;
+        s->setRange(lo, hi);
+        s->setDecimals(0);
+        s->setSingleStep(step);
+        s->setSuffix(QStringLiteral(" %"));
+        s->setValue(v);
+        return s;
+        };
+    imageZoomSpin_ = makePctSpin(10, 400, 5, 100);
+    imageZoomSpin_->setToolTip(tr("在顯示方式的基礎上再放大 / 縮小。放大後超出框的部分會被裁掉。"));
+    imageFocusXSpin_ = makePctSpin(0, 100, 5, 50);
+    imageFocusXSpin_->setToolTip(tr("圖片在框內的水平位置：0 = 靠左 (裁切時保留左邊)，50 = 置中，100 = 靠右"));
+    imageFocusYSpin_ = makePctSpin(0, 100, 5, 50);
+    imageFocusYSpin_->setToolTip(tr("圖片在框內的垂直位置：0 = 靠上 (裁切時保留上方)，50 = 置中，100 = 靠下"));
+    imf->addRow(tr("縮放"), imageZoomSpin_);
+    imf->addRow(tr("水平位置"), imageFocusXSpin_);
+    imf->addRow(tr("垂直位置"), imageFocusYSpin_);
     root->addWidget(imageGroup_);
 
     root->addStretch(1);
@@ -544,9 +698,13 @@ QWidget* DesignerWindow::buildPropertyPanel() {
             });
         };
     hookSpin(xSpin_, [](card::Element& e, double v) { e.xMm = v; });
-    hookSpin(ySpin_, [](card::Element& e, double v) { e.yMm = v; });
+    hookSpin(ySpin_, [this](card::Element& e, double v) { e.yMm = card::fromUiY(v, e.hMm, layout_.heightMm()); });
     hookSpin(wSpin_, [](card::Element& e, double v) { e.wMm = v; });
-    hookSpin(hSpin_, [](card::Element& e, double v) { e.hMm = v; });
+    hookSpin(hSpin_, [this](card::Element& e, double v) {      // 以底邊為基準：底邊不動，往上長高
+        const double bottom = layout_.heightMm() - (e.yMm + e.hMm);
+        e.hMm = v;
+        e.yMm = layout_.heightMm() - bottom - v;
+        });
     hookSpin(sizeSpin_, [](card::Element& e, double v) { e.fontPt = v; });
 
     connect(textEdit_, &QPlainTextEdit::textChanged, this, [this] {
@@ -591,8 +749,61 @@ QWidget* DesignerWindow::buildPropertyPanel() {
         imageEdit_->setText(QDir::toNativeSeparators(f));
         updating_ = prev;
         });
-    connect(keepAspectCheck_, &QCheckBox::toggled, this, [this](bool on) {
-        editSelected([&](card::Element& e) { e.keepAspect = on; });
+    // 圖片：來源 / 資料夾 / 比對欄位 / 顯示方式 (每個圖片元素各自一組)
+    connect(imageSourceCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_) return;
+        editSelected([&](card::Element& e) { e.imageSource = i == 0 ? card::ImageSource::Fixed : card::ImageSource::Dynamic; });
+        onImageSourceChanged();
+        });
+    connect(imageFolderEdit_, &QLineEdit::editingFinished, this, [this] {
+        if (updating_) return;
+        ElementItem* it = selectedItem();
+        const card::Element* e = it ? layout_.find(it->id()) : nullptr;
+        if (e && imageFolderEdit_->text().trimmed() != e->imageFolder.trimmed()) setImageFolder(imageFolderEdit_->text());
+        });
+    connect(folderBtn, &QPushButton::clicked, this, [this] {
+        ElementItem* it = selectedItem();
+        const card::Element* e = it ? layout_.find(it->id()) : nullptr;
+        if (!e) return;
+        const QString start = QDir(e->imageFolder).exists() ? e->imageFolder : lastDataDir_;
+        const QString dir = QFileDialog::getExistingDirectory(this, tr("選擇圖片資料夾"), start);
+        if (!dir.isEmpty()) setImageFolder(dir);
+        });
+    connect(matchFieldCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (updating_) return;
+        const QString f = matchFieldCombo_->currentText();
+        editSelected([&](card::Element& e) { e.matchField = f; });
+        QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner")).setValue(QStringLiteral("lastMatchField"), f);
+        onImageSourceChanged();
+        });
+    connect(rescanBtn, &QPushButton::clicked, this, [this] {
+        ElementItem* it = selectedItem();
+        const card::Element* e = it ? layout_.find(it->id()) : nullptr;
+        if (!e) return;
+        imagePool_.rescan(e->imageFolder);
+        onImageSourceChanged();
+        });
+    connect(imageFitCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_) return;
+        editSelected([&](card::Element& e) {
+            e.imageFit = static_cast<card::ImageFit>(i);
+            e.fitContent = (e.imageFit == card::ImageFit::MatchHeight);     // 「框高依圖片比例」= 貼合圖片
+            });
+        if (ElementItem* it = selectedItem()) populatePanel(layout_.find(it->id()));   // 更新高度欄位 / 縮放欄位的啟用狀態
+        });
+    connect(imageZoomSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        editSelected([&](card::Element& e) { e.imageZoomPct = v; });
+        });
+    connect(imageFocusXSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        editSelected([&](card::Element& e) { e.imageFocusX = v; });
+        });
+    connect(imageFocusYSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        editSelected([&](card::Element& e) { e.imageFocusY = v; });
+        });
+    connect(fitCheck_, &QCheckBox::toggled, this, [this](bool on) {
+        if (updating_) return;
+        editSelected([&](card::Element& e) { e.fitContent = on; });      // 開啟時 editSelected 會立刻貼合
+        if (ElementItem* it = selectedItem()) populatePanel(layout_.find(it->id()));   // 更新數字與寬 / 高欄位的啟用狀態
         });
 
     populatePanel(nullptr);
@@ -643,30 +854,6 @@ QWidget* DesignerWindow::buildDataPanel() {
     top->addWidget(dataInfo_, 1);
     v->addLayout(top);
 
-    // ---- 圖片對應：指定資料夾 + 用哪個欄位去比對檔名 ----
-    auto* imgGroup = new QGroupBox(tr("圖片對應 (自動帶入照片)"));
-    auto* ig = new QVBoxLayout(imgGroup);
-    auto* dirRow = new QHBoxLayout;
-    imageDirEdit_ = new QLineEdit;
-    imageDirEdit_->setPlaceholderText(tr("圖片資料夾路徑"));
-    auto* dirBtn = new QPushButton(tr("選擇…"));
-    dirRow->addWidget(imageDirEdit_, 1);
-    dirRow->addWidget(dirBtn);
-    ig->addLayout(dirRow);
-    auto* matchRow = new QHBoxLayout;
-    matchFieldCombo_ = new QComboBox;
-    matchFieldCombo_->addItems(card::fieldNames());
-    matchFieldCombo_->setToolTip(tr("用這個欄位的值，去找「檔名包含該值」的圖片"));
-    auto* rescanBtn = new QPushButton(tr("重新掃描"));
-    rescanBtn->setToolTip(tr("資料夾內的圖片有增減時按這裡"));
-    matchRow->addWidget(new QLabel(tr("以此欄位比對檔名：")));
-    matchRow->addWidget(matchFieldCombo_, 1);
-    matchRow->addWidget(rescanBtn);
-    ig->addLayout(matchRow);
-    imageSummary_ = new QLabel;
-    imageSummary_->setWordWrap(true);
-    ig->addWidget(imageSummary_);
-    v->addWidget(imgGroup);
 
     dataFilter_ = new QLineEdit;
     dataFilter_->setPlaceholderText(tr("搜尋 (姓名、學號、系所…)"));
@@ -676,6 +863,8 @@ QWidget* DesignerWindow::buildDataPanel() {
     const QStringList& fields = card::fieldNames();
     dataTable_ = new QTableWidget(0, fields.size() + 1);          // 最後一欄是「圖片」比對結果
     dataTable_->setHorizontalHeaderLabels(QStringList(fields) << tr("圖片"));
+    if (auto* h = dataTable_->horizontalHeaderItem(fields.size()))
+        h->setToolTip(tr("目前選取的「動態圖片」元素的比對結果 (沒有選取時顯示版面中第一個動態圖片)。\n圖片的資料夾與比對欄位在右邊「屬性」面板設定，每個圖片各自設定。"));
     dataTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     dataTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     dataTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -690,29 +879,6 @@ QWidget* DesignerWindow::buildDataPanel() {
         if (row >= 0) applyDataRow(row);
         });
 
-    connect(dirBtn, &QPushButton::clicked, this, [this] { browseImageFolder(); });
-    connect(imageDirEdit_, &QLineEdit::editingFinished, this, [this] {
-        if (imageDirEdit_->text().trimmed() != imageMatcher_.folder()) setImageFolder(imageDirEdit_->text());
-        });
-    connect(rescanBtn, &QPushButton::clicked, this, [this] {
-        imageMatcher_.rescan();
-        refreshImageMatches();
-        });
-    connect(matchFieldCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-        QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"))
-            .setValue(QStringLiteral("matchField"), matchField());
-        refreshImageMatches();
-        });
-
-    // 還原上次的設定
-    {
-        QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));
-        const int i = matchFieldCombo_->findText(st.value(QStringLiteral("matchField"), QStringLiteral("姓名")).toString());
-        if (i >= 0) { QSignalBlocker b(matchFieldCombo_); matchFieldCombo_->setCurrentIndex(i); }
-        const QString dir = st.value(QStringLiteral("imageFolder")).toString();
-        imageDirEdit_->setText(dir);
-        imageMatcher_.setFolder(dir);
-    }
     refreshImageMatches();
     return w;
 }
@@ -723,9 +889,24 @@ void DesignerWindow::applyPreviewRecord() {
     previewRecord_.clear();
     if (usePreviewCheck_ && usePreviewCheck_->isChecked()) {
         for (const auto& pr : previewEdits_) previewRecord_.insert(pr.first, pr.second->text());
-        imageMatcher_.applyTo(previewRecord_, matchField());      // 依比對欄位帶入圖片
+        imagePool_.applyTo(previewRecord_, layout_);              // 各動態圖片依自己的資料夾與比對欄位帶入圖片
     }
+    refitAll();
     if (scene_) scene_->update();
+}
+
+void DesignerWindow::refitAll() {
+    if (!scene_) return;
+    bool any = false;
+    for (auto& e : layout_.elements) {
+        if (!e.fitContent || !card::fitElement(e, previewRecord_)) continue;
+        any = true;
+        if (ElementItem* it = findItem(e.id)) it->syncFromModel();
+        if (card::Element* b = baseline_.find(e.id))       // 因預覽資料而改變的大小，不算使用者的編輯 (不產生復原步驟)
+            if (b->fitContent) { b->xMm = e.xMm; b->yMm = e.yMm; b->wMm = e.wMm; b->hMm = e.hMm; }
+    }
+    if (!any) return;
+    if (ElementItem* sel = selectedItem()) populatePanel(layout_.find(sel->id()));
 }
 
 ElementItem* DesignerWindow::createItem(const QString& id, int z) {
@@ -738,6 +919,8 @@ ElementItem* DesignerWindow::createItem(const QString& id, int z) {
 
 void DesignerWindow::rebuildScene(bool refit) {
     updating_ = true;
+    imagePool_.ensureAll(layout_);         // 開啟版面 / 復原後，動態圖片用到的資料夾要掃描
+    card::fitAll(layout_, previewRecord_); // 貼合內容的元素依目前預覽資料重新貼合
     scene_->clear();                       // 會刪除舊的卡片與所有元素
     cardItem_ = nullptr;
     guides_ = nullptr;
@@ -815,8 +998,14 @@ void DesignerWindow::addElement(card::ElementType type) {
     else {
         e.name = tr("圖片 %1").arg(count);
         e.xMm = 5; e.yMm = 5; e.wMm = 25; e.hMm = 25;
+        QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));        // 沿用上次使用的資料夾 / 比對欄位
+        e.imageSource = card::ImageSource::Dynamic;
+        e.imageFolder = st.value(QStringLiteral("lastImageFolder"), st.value(QStringLiteral("imageFolder"))).toString();
+        e.matchField = st.value(QStringLiteral("lastMatchField"), st.value(QStringLiteral("matchField"), QStringLiteral("姓名"))).toString();
+        e.imageFit = card::ImageFit::Cover;
     }
     layout_.elements.append(e);
+    imagePool_.ensureAll(layout_);
     createItem(e.id, layout_.elements.size() - 1);
     refreshList();
 
@@ -867,6 +1056,7 @@ void DesignerWindow::openLayout() {
         return;
     }
     commitUndo();
+    migrateLegacyImageSettings(loaded);    // 舊版面檔沒有「每個圖片自己的資料夾」：沿用上次使用的設定
     layout_ = loaded;
     rebuildScene();
     commitUndo();                          // 開啟版面也可以用 Ctrl+Z 退回開啟前
@@ -907,8 +1097,8 @@ void DesignerWindow::openPrintDialog() {
 
     PrintInput in;
     in.layout = layout_;
-    in.matcher = imageMatcher_;
-    in.matchField = matchField();
+    imagePool_.ensureAll(layout_);
+    in.imagePool = imagePool_;
 
     if (data_.rows.isEmpty()) {
         // 還沒載入 Excel：用「預覽資料」欄位的內容印 1 張 (方便先用單張測試印表機與版面)
@@ -994,42 +1184,78 @@ bool DesignerWindow::loadData(const QString& path) {
     return true;
 }
 
-QString DesignerWindow::matchField() const {
-    return matchFieldCombo_ ? matchFieldCombo_->currentText() : card::fieldNames().value(0);
+// ================================================== 圖片 (每個圖片元素各自設定) ===
+
+// 左邊資料表的「圖片」欄 / 右邊的統計文字，顯示哪個圖片元素的比對結果：
+// 選取的動態圖片；沒有選取動態圖片時，用版面中第一個動態圖片。
+const card::Element* DesignerWindow::imageTarget() {
+    if (ElementItem* it = selectedItem()) {
+        const card::Element* e = layout_.find(it->id());
+        if (e && e->type == card::ElementType::Image && e->imageSource == card::ImageSource::Dynamic) return e;
+    }
+    for (const auto& e : layout_.elements)
+        if (e.type == card::ElementType::Image && e.imageSource == card::ImageSource::Dynamic) return &e;
+    return nullptr;
 }
 
-void DesignerWindow::browseImageFolder() {
-    const QString start = imageMatcher_.hasFolder() ? imageMatcher_.folder() : lastDataDir_;
-    const QString dir = QFileDialog::getExistingDirectory(this, tr("選擇圖片資料夾"), start);
-    if (!dir.isEmpty()) setImageFolder(dir);
-}
-
+// 把「選取的圖片元素」的資料夾設成 dir
 void DesignerWindow::setImageFolder(const QString& dir) {
+    ElementItem* it = selectedItem();
+    const card::Element* cur = it ? layout_.find(it->id()) : nullptr;
+    if (!cur || cur->type != card::ElementType::Image) return;
     const QString d = dir.trimmed().isEmpty() ? QString() : QDir::toNativeSeparators(dir.trimmed());
     if (!d.isEmpty() && !QDir(d).exists()) {
         QMessageBox::warning(this, tr("資料夾不存在"), d);
-        imageDirEdit_->setText(imageMatcher_.folder());
+        populatePanel(cur);                // 輸入框還原成目前的值
         return;
     }
-    imageMatcher_.setFolder(d);
-    imageDirEdit_->setText(d);
-    QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"))
-        .setValue(QStringLiteral("imageFolder"), d);
-    refreshImageMatches();
+    editSelected([&](card::Element& e) { e.imageFolder = d; });
+    if (!d.isEmpty())
+        QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner")).setValue(QStringLiteral("lastImageFolder"), d);
+    onImageSourceChanged();
 }
 
-// 依目前的資料夾與比對欄位，重算每一筆資料的圖片對應結果，更新表格「圖片」欄、統計文字與預覽
-void DesignerWindow::refreshImageMatches() {
+// 來源 / 資料夾 / 比對欄位改變後：掃描新的資料夾、重新比對、更新預覽與面板
+void DesignerWindow::onImageSourceChanged() {
+    imagePool_.ensureAll(layout_);
+    refreshImageMatches();                 // 內含 applyPreviewRecord()
+    if (ElementItem* it = selectedItem()) populatePanel(layout_.find(it->id()));
+}
+
+// 舊版是整個程式共用一個圖片資料夾 / 比對欄位 (存在設定檔)；現在每個圖片元素各自設定。
+// 資料夾或欄位是空的動態圖片，沿用上次使用的設定，舊版面檔 / 舊設定就不需要重新設定。
+void DesignerWindow::migrateLegacyImageSettings(card::CardLayout& lay) {
+    QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));
+    const QString folder = st.value(QStringLiteral("lastImageFolder"), st.value(QStringLiteral("imageFolder"))).toString();
+    const QString field = st.value(QStringLiteral("lastMatchField"), st.value(QStringLiteral("matchField"), QStringLiteral("姓名"))).toString();
+    for (auto& e : lay.elements) {
+        if (e.type != card::ElementType::Image || e.imageSource != card::ImageSource::Dynamic) continue;
+        if (e.imageFolder.trimmed().isEmpty()) e.imageFolder = folder;
+        if (e.matchField.trimmed().isEmpty()) e.matchField = field;
+    }
+}
+
+// 依「目標圖片元素」的資料夾與比對欄位，重算每一筆資料的圖片對應結果，更新表格「圖片」欄、統計文字與預覽
+void DesignerWindow::refreshImageMatches(bool force) {
+    const card::Element* target = imageTarget();
     const int imgCol = dataTable_->columnCount() - 1;
-    const QString field = matchField();
-    const bool hasFolder = imageMatcher_.hasFolder();
+    const QString folder = target ? target->imageFolder : QString();
+    const QString field = target ? target->matchField : QString();
+    const card::ImageMatcher* matcher = target ? imagePool_.find(folder) : nullptr;
+    const bool hasFolder = matcher != nullptr;
+
+    const QString key = QStringLiteral("%1|%2|%3|%4|%5").arg(target ? target->id : QString(), folder, field)
+        .arg(data_.rows.size()).arg(matcher ? matcher->fileCount() : -1);
+    if (!force && key == lastImageRefreshKey_) return;       // 條件沒變 (例如只是換選取的元素)：不用重算
+    lastImageRefreshKey_ = key;
 
     // 資料本身重名 (比對欄位內相同的值出現多次)：就算圖片只有一張，也不知道該給誰
     QHash<QString, int> valueCount;
-    for (const auto& rec : data_.rows) {
-        const QString k = rec.value(field).trimmed().toLower();
-        if (!k.isEmpty()) valueCount[k]++;
-    }
+    if (target)
+        for (const auto& rec : data_.rows) {
+            const QString k = rec.value(field).trimmed().toLower();
+            if (!k.isEmpty()) valueCount[k]++;
+        }
 
     int ok = 0, notFound = 0, imgDup = 0, dataDup = 0, noValue = 0;
     dataTable_->setUpdatesEnabled(false);
@@ -1041,7 +1267,7 @@ void DesignerWindow::refreshImageMatches() {
         }
         else {
             const QString value = data_.rows[r].value(field);
-            const card::ImageMatch m = imageMatcher_.find(value);
+            const card::ImageMatch m = matcher->find(value);
             const int same = valueCount.value(value.trimmed().toLower());
             if (m.status == card::ImageMatch::NoValue) {
                 item->setText(tr("－ %1 無資料").arg(field));
@@ -1075,16 +1301,19 @@ void DesignerWindow::refreshImageMatches() {
     }
     dataTable_->setUpdatesEnabled(true);
 
-    // 統計文字
+    // 統計文字 (顯示在右邊屬性面板的圖片區塊)
     QString s;
-    if (!hasFolder && !imageDirEdit_->text().trimmed().isEmpty()) {
-        s = tr("找不到資料夾：%1").arg(imageDirEdit_->text().trimmed());
+    if (!target) {
+        s.clear();
+    }
+    else if (folder.trimmed().isEmpty()) {
+        s = tr("尚未設定圖片資料夾。");
     }
     else if (!hasFolder) {
-        s = tr("尚未設定圖片資料夾。圖片元素的「圖片路徑」留空時，會依此處設定自動帶入照片。");
+        s = tr("找不到資料夾：%1").arg(folder.trimmed());
     }
     else {
-        s = tr("資料夾內有 %1 張圖片。").arg(imageMatcher_.fileCount());
+        s = tr("資料夾內有 %1 張圖片。").arg(matcher->fileCount());
         if (data_.rows.isEmpty()) {
             s += tr("載入資料後會顯示每一筆的比對結果。");
         }
@@ -1097,7 +1326,7 @@ void DesignerWindow::refreshImageMatches() {
             if (imgDup || dataDup) s += tr("\n重名的資料不會被當成「可用」，建議改用較不會重複的欄位 (例如學號)。");
         }
     }
-    imageSummary_->setText(s);
+    if (imageSummary_) imageSummary_->setText(s);
 
     applyPreviewRecord();                  // 目前預覽的那一筆也要換圖
 }
@@ -1157,16 +1386,17 @@ void DesignerWindow::updateDataInfo() {
 // ============================================================ 鍍膜範圍 (階段 4) ===
 
 namespace {
-    QString regionLabel(const card::TopcoatRegion& r) {
+    QString regionLabel(const card::TopcoatRegion& r, double cardHMm) {   // 座標以卡面左下角為原點
         return QStringLiteral("%1  (%2, %3)  %4 × %5 mm")
             .arg(RegionItem::kindText(r.kind))
-            .arg(r.xMm, 0, 'f', 1).arg(r.yMm, 0, 'f', 1).arg(r.wMm, 0, 'f', 1).arg(r.hMm, 0, 'f', 1);
+            .arg(r.xMm, 0, 'f', 1).arg(card::toUiY(r.yMm, r.hMm, cardHMm), 0, 'f', 1).arg(r.wMm, 0, 'f', 1).arg(r.hMm, 0, 'f', 1);
     }
 }
 
 QWidget* DesignerWindow::buildTopcoatPanel() {
     auto* w = new QWidget;
-    w->setMinimumWidth(300);
+    w->setMinimumWidth(uiscale::px(300));
+    topcoatPanel_ = w;
     auto* root = new QVBoxLayout(w);
 
     // --- 基本設定：PrintTicket ---
@@ -1190,7 +1420,7 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
     rl->addWidget(hint);
 
     regionList_ = new QListWidget;
-    regionList_->setMinimumHeight(90);
+    regionList_->setMinimumHeight(uiscale::px(90));
     rl->addWidget(regionList_);
     auto* btnRow = new QHBoxLayout;
     auto* addBtn = new QPushButton(tr("新增範圍"));
@@ -1260,9 +1490,13 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
             });
         };
     hook(rxSpin_, [](card::TopcoatRegion& r, double v) { r.xMm = v; });
-    hook(rySpin_, [](card::TopcoatRegion& r, double v) { r.yMm = v; });
+    hook(rySpin_, [this](card::TopcoatRegion& r, double v) { r.yMm = card::fromUiY(v, r.hMm, layout_.heightMm()); });
     hook(rwSpin_, [](card::TopcoatRegion& r, double v) { r.wMm = v; });
-    hook(rhSpin_, [](card::TopcoatRegion& r, double v) { r.hMm = v; });
+    hook(rhSpin_, [this](card::TopcoatRegion& r, double v) {   // 底邊不動，往上長高
+        const double bottom = layout_.heightMm() - (r.yMm + r.hMm);
+        r.hMm = v;
+        r.yMm = layout_.heightMm() - bottom - v;
+        });
 
     populateRegionEditor(nullptr);
     return w;
@@ -1349,7 +1583,7 @@ void DesignerWindow::refreshRegionList() {
     updating_ = true;
     regionList_->clear();
     for (const auto& r : layout_.topcoat.regions) {
-        auto* li = new QListWidgetItem(regionLabel(r));
+        auto* li = new QListWidgetItem(regionLabel(r, layout_.heightMm()));
         li->setData(Qt::UserRole, r.id);
         li->setForeground(RegionItem::kindColor(r.kind).darker(130));
         regionList_->addItem(li);
@@ -1361,7 +1595,7 @@ void DesignerWindow::refreshRegionListLabel(const card::TopcoatRegion& r) {
     for (int i = 0; i < regionList_->count(); ++i) {
         QListWidgetItem* li = regionList_->item(i);
         if (li->data(Qt::UserRole).toString() == r.id) {
-            li->setText(regionLabel(r));
+            li->setText(regionLabel(r, layout_.heightMm()));
             li->setForeground(RegionItem::kindColor(r.kind).darker(130));
             break;
         }
@@ -1384,7 +1618,7 @@ void DesignerWindow::populateRegionEditor(const card::TopcoatRegion* r) {
     if (r) {
         regionKindCombo_->setCurrentIndex(int(r->kind));
         rxSpin_->setValue(r->xMm);
-        rySpin_->setValue(r->yMm);
+        rySpin_->setValue(card::toUiY(r->yMm, r->hMm, layout_.heightMm()));
         rwSpin_->setValue(r->wMm);
         rhSpin_->setValue(r->hMm);
     }
@@ -1441,7 +1675,49 @@ void DesignerWindow::refreshTopcoatPreview() {
 
 void DesignerWindow::updateColorButton(const QColor& c) {
     colorBtn_->setStyleSheet(
-        QStringLiteral("background-color:%1; border:1px solid #888; min-height:22px;").arg(c.name()));
+        QStringLiteral("background-color:%1; border:1px solid #888; min-height:%2px;").arg(c.name()).arg(uiscale::px(22)));
+}
+
+// ============================================================ 介面大小 / 視窗 ===
+
+void DesignerWindow::applyUiScale() {
+    using uiscale::px;
+    if (rulerH_) rulerH_->applyScale();
+    if (rulerV_) rulerV_->applyScale();
+    if (cornerLabel_ && rulerH_) {
+        cornerLabel_->setFixedSize(rulerH_->thickness(), rulerH_->thickness());
+        cornerLabel_->setStyleSheet(QStringLiteral("background:#dedede; color:#555; font-size:%1px; border-right:1px solid #a0a0a0; border-bottom:1px solid #a0a0a0;").arg(px(9)));
+    }
+    for (QToolBar* tb : findChildren<QToolBar*>()) {
+        tb->setStyleSheet(toolbarStyle());
+        if (QToolButton* pb = tb->findChild<QToolButton*>(QStringLiteral("btnPrint"))) pb->setStyleSheet(printButtonStyle());
+    }
+    if (cursorLabel_) cursorLabel_->setMinimumWidth(px(260));
+    if (recordLabel_) recordLabel_->setMinimumWidth(px(110));
+    if (propertyPanel_) propertyPanel_->setMinimumWidth(px(300));
+    if (topcoatPanel_) topcoatPanel_->setMinimumWidth(px(300));
+    if (textEdit_) textEdit_->setFixedHeight(px(64));
+    if (regionList_) regionList_->setMinimumHeight(px(90));
+    if (colorBtn_) {
+        if (ElementItem* it = selectedItem()) if (const card::Element* e = layout_.find(it->id())) updateColorButton(e->color);
+    }
+    // 「介面大小」選單：勾選目前的設定；「自動」旁邊顯示目前實際套用的比例
+    for (QAction* a : scaleActs_) {
+        const int p = a->data().toInt();
+        a->setChecked(p == uiscale::state().stored);
+        if (p == 0) a->setText(tr("自動 (依螢幕大小，目前 %1%)").arg(uiscale::autoPercent()));
+    }
+    uiscale::clampToScreen(this);
+    applyDockSizes();
+    if (isVisible()) QTimer::singleShot(0, this, [this] { fitView(); });
+    if (statusBar() && isVisible()) statusBar()->showMessage(tr("介面大小：%1%").arg(uiscale::state().percent), 4000);
+}
+
+void DesignerWindow::fitWindowToScreen() {
+    if (isFullScreen() || isMaximized()) showNormal();
+    resetDockLayout();
+    uiscale::fitWindowToScreen(this, 1360, 840);
+    QTimer::singleShot(0, this, [this] { applyDockSizes(); fitView(); });
 }
 
 void DesignerWindow::populatePanel(const card::Element* e) {
@@ -1453,9 +1729,15 @@ void DesignerWindow::populatePanel(const card::Element* e) {
         nameEdit_->setText(e->name);
         typeLabel_->setText(typeText(*e));
         xSpin_->setValue(e->xMm);
-        ySpin_->setValue(e->yMm);
+        ySpin_->setValue(card::toUiY(e->yMm, e->hMm, layout_.heightMm()));
         wSpin_->setValue(e->wMm);
         hSpin_->setValue(e->hMm);
+        const bool isText = e->type == card::ElementType::Text;
+        fitCheck_->setText(tr("貼合文字 (框的大小跟隨文字)"));
+        fitCheck_->setVisible(isText);                      // 圖片的「框高依圖片比例」放在圖片區塊的「顯示方式」
+        fitCheck_->setChecked(isText && e->fitContent);
+        wSpin_->setEnabled(!(e->fitContent && isText));     // 貼合時，由內容決定的尺寸不能手動改
+        hSpin_->setEnabled(!e->fitContent);                 // 文字貼合 / 圖片「框高依圖片比例」時，高度由內容決定
 
         textGroup_->setVisible(e->type == card::ElementType::Text);
         imageGroup_->setVisible(e->type == card::ElementType::Image);
@@ -1468,8 +1750,23 @@ void DesignerWindow::populatePanel(const card::Element* e) {
         alignCombo_->setCurrentIndex(static_cast<int>(e->align));
         updateColorButton(e->color);
 
-        if (imageEdit_->text() != e->imagePath) imageEdit_->setText(e->imagePath);
-        keepAspectCheck_->setChecked(e->keepAspect);
+        if (e->type == card::ElementType::Image) {
+            const bool dyn = e->imageSource == card::ImageSource::Dynamic;
+            imageSourceCombo_->setCurrentIndex(dyn ? 1 : 0);
+            imageFixedBox_->setVisible(!dyn);
+            imageDynBox_->setVisible(dyn);
+            if (imageEdit_->text() != e->imagePath) imageEdit_->setText(e->imagePath);
+            if (imageFolderEdit_->text() != e->imageFolder) imageFolderEdit_->setText(e->imageFolder);
+            matchFieldCombo_->setCurrentIndex(matchFieldCombo_->findText(e->matchField));   // 找不到 (-1) = 空白，請使用者選
+            imageFitCombo_->setCurrentIndex(static_cast<int>(e->imageFit));
+            imageZoomSpin_->setValue(e->imageZoomPct);
+            imageFocusXSpin_->setValue(e->imageFocusX);
+            imageFocusYSpin_->setValue(e->imageFocusY);
+            const bool crop = e->imageFit == card::ImageFit::Cover || e->imageFit == card::ImageFit::Contain;
+            imageZoomSpin_->setEnabled(crop);               // 拉伸 / 框高依圖片比例時，縮放與位置沒有作用
+            imageFocusXSpin_->setEnabled(crop);
+            imageFocusYSpin_->setEnabled(crop);
+        }
     }
     else {
         nameEdit_->clear();
@@ -1515,6 +1812,7 @@ void DesignerWindow::onSelectionChanged() {
     RegionItem* rg = selectedRegion();
     syncListSelection(it ? it->id() : QString());
     populatePanel(it ? layout_.find(it->id()) : nullptr);
+    refreshImageMatches(false);            // 「圖片」欄顯示目前選取的動態圖片的比對結果 (條件沒變就不重算)
     if (it && propertyDock_->isVisible()) propertyDock_->raise();
     if (rg) {
         syncRegionListSelection(rg->id());
@@ -1532,6 +1830,10 @@ void DesignerWindow::onSelectionChanged() {
 void DesignerWindow::onItemChanged(const QString& id) {
     if (updating_) return;
     scheduleCommit();
+    if (card::Element* fe = layout_.find(id)) {                 // 拖曳 / 縮放後，貼合內容的元素把大小拉回貼合值
+        if (fe->fitContent && card::fitElement(*fe, previewRecord_))
+            if (ElementItem* fi = findItem(id)) fi->syncFromModel();
+    }
     ElementItem* it = selectedItem();
     if (it && it->id() == id) populatePanel(layout_.find(id));    // 拖曳/縮放時，同步更新面板數字
 }
@@ -1543,9 +1845,11 @@ void DesignerWindow::editSelected(const std::function<void(card::Element&)>& fn)
     card::Element* e = layout_.find(it->id());
     if (!e) return;
     fn(*e);
+    const bool fitted = e->fitContent && card::fitElement(*e, previewRecord_);   // 文字 / 字型 / 圖片等改變後立即貼合
     it->syncFromModel();
     it->update();
     refreshListName(*e);
+    if (fitted) populatePanel(e);                                // 同步面板上的 X / Y / 寬 / 高
     scheduleCommit();
 }
 
@@ -1557,7 +1861,7 @@ void DesignerWindow::updateCursorLabel(const QPointF& scenePos, bool inside) {
     if (inside)
         s += tr("　｜　游標 X %1  Y %2 mm")
         .arg(scenePos.x() / ElementItem::kPxPerMm, 0, 'f', 1)
-        .arg(scenePos.y() / ElementItem::kPxPerMm, 0, 'f', 1);
+        .arg(card::flipY(scenePos.y() / ElementItem::kPxPerMm, layout_.heightMm()), 0, 'f', 1);   // 原點在左下角
     cursorLabel_->setText(s);
 }
 

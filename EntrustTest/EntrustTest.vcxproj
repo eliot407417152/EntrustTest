@@ -148,6 +148,7 @@
     <ClInclude Include="SnapGuides.h" />
     <ClInclude Include="Stdafx.h" />
     <ClInclude Include="TopcoatSpec.h" />
+    <ClInclude Include="UiScale.h" />
     <ClInclude Include="util.h" />
     <QtMoc Include="MainWindow.h" />
   </ItemGroup>

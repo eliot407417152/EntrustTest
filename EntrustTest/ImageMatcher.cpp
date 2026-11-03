@@ -14,6 +14,9 @@ namespace card {
         return k;
     }
 
+    QString autoImageKeyFor(const QString& elementId) { return QStringLiteral("@image:") + elementId; }
+    QString autoImageNoteKeyFor(const QString& elementId) { return QStringLiteral("@imageNote:") + elementId; }
+
     QString ImageMatch::note() const {
         switch (status) {
         case NoValue:   return QStringLiteral("[欄位無資料]");
@@ -69,6 +72,70 @@ namespace card {
         const ImageMatch m = find(rec.value(field));
         rec.insert(autoImageKey(), m.path);
         rec.insert(autoImageNoteKey(), m.note());
+    }
+
+    // ------------------------------------------------------------ ImageMatcherPool ---
+
+    QString ImageMatcherPool::normalize(const QString& folder) {
+        const QString t = folder.trimmed();
+        return t.isEmpty() ? QString() : QDir::cleanPath(QDir::fromNativeSeparators(t));
+    }
+
+    bool ImageMatcherPool::ensure(const QString& folder) {
+        const QString key = normalize(folder);
+        if (key.isEmpty()) return false;
+        if (byFolder_.contains(key)) return true;
+        ImageMatcher m;
+        if (!m.setFolder(folder.trimmed()) || !m.hasFolder()) return false;     // 資料夾不存在：不快取，之後建立了還能再試
+        byFolder_.insert(key, m);
+        return true;
+    }
+
+    void ImageMatcherPool::ensureAll(const CardLayout& layout) {
+        for (const Element& e : layout.elements)
+            if (e.type == ElementType::Image && e.imageSource == ImageSource::Dynamic) ensure(e.imageFolder);
+    }
+
+    void ImageMatcherPool::rescan(const QString& folder) {
+        const QString key = normalize(folder);
+        if (key.isEmpty()) return;
+        auto it = byFolder_.find(key);
+        if (it != byFolder_.end()) it->rescan();
+        else ensure(folder);
+    }
+
+    const ImageMatcher* ImageMatcherPool::find(const QString& folder) const {
+        const auto it = byFolder_.constFind(normalize(folder));
+        return it == byFolder_.constEnd() ? nullptr : &it.value();
+    }
+
+    QString ImageMatcherPool::folderProblem(const QString& folder) const {
+        if (folder.trimmed().isEmpty()) return QStringLiteral("尚未設定圖片資料夾");
+        if (!find(folder)) return QStringLiteral("找不到圖片資料夾：%1").arg(QDir::toNativeSeparators(folder.trimmed()));
+        return QString();
+    }
+
+    ImageMatch ImageMatcherPool::match(const QString& folder, const QString& value) const {
+        const ImageMatcher* m = find(folder);
+        return m ? m->find(value) : ImageMatch();
+    }
+
+    void ImageMatcherPool::applyTo(Record& rec, const CardLayout& layout) const {
+        for (const Element& e : layout.elements) {
+            if (e.type != ElementType::Image || e.imageSource != ImageSource::Dynamic) continue;
+            QString path, note;
+            const QString problem = folderProblem(e.imageFolder);
+            if (!problem.isEmpty()) {
+                note = QStringLiteral("[%1]").arg(problem);
+            }
+            else {
+                const ImageMatch m = match(e.imageFolder, rec.value(e.matchField));
+                path = m.path;
+                note = m.note();
+            }
+            rec.insert(autoImageKeyFor(e.id), path);
+            rec.insert(autoImageNoteKeyFor(e.id), note);
+        }
     }
 
 } // namespace card

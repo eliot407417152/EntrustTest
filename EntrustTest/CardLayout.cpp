@@ -24,9 +24,27 @@ namespace card {
         }
     }
 
+    namespace {
+        QString fitToStr(ImageFit f) {
+            switch (f) {
+            case ImageFit::Contain: return QStringLiteral("contain");
+            case ImageFit::Stretch: return QStringLiteral("stretch");
+            case ImageFit::MatchHeight: return QStringLiteral("matchHeight");
+            default: return QStringLiteral("cover");
+            }
+        }
+        ImageFit strToFit(const QString& s) {
+            if (s == QLatin1String("contain")) return ImageFit::Contain;
+            if (s == QLatin1String("stretch")) return ImageFit::Stretch;
+            if (s == QLatin1String("matchHeight")) return ImageFit::MatchHeight;
+            return ImageFit::Cover;
+        }
+    }
+
     // ------------------------------------------------------------------ Element ---
 
     bool Element::isDynamic() const {
+        if (type == ElementType::Image && imageSource == ImageSource::Dynamic) return true;   // 依資料帶入的圖片
         const QString& s = (type == ElementType::Text) ? text : imagePath;
         const int a = s.indexOf(QLatin1Char('{'));
         return a >= 0 && s.indexOf(QLatin1Char('}'), a) > a;
@@ -50,6 +68,14 @@ namespace card {
         o["align"] = alignToStr(align);
         o["imagePath"] = imagePath;
         o["keepAspect"] = keepAspect;
+        o["fitContent"] = fitContent;
+        o["imageSource"] = imageSource == ImageSource::Fixed ? QStringLiteral("fixed") : QStringLiteral("dynamic");
+        o["imageFolder"] = imageFolder;
+        o["matchField"] = matchField;
+        o["imageFit"] = fitToStr(imageFit);
+        o["imageZoomPct"] = imageZoomPct;
+        o["imageFocusX"] = imageFocusX;
+        o["imageFocusY"] = imageFocusY;
         return o;
     }
 
@@ -72,6 +98,19 @@ namespace card {
         e.align = strToAlign(o.value("align").toString());
         e.imagePath = o.value("imagePath").toString();
         e.keepAspect = o.value("keepAspect").toBool(true);
+        e.fitContent = o.value("fitContent").toBool(false);
+        // 圖片來源：舊版面檔沒有這個欄位 -> 路徑留空 = 動態 (依資料夾比對)，有路徑 = 固定
+        if (o.contains("imageSource")) e.imageSource = o.value("imageSource").toString() == QLatin1String("fixed") ? ImageSource::Fixed : ImageSource::Dynamic;
+        else e.imageSource = e.imagePath.trimmed().isEmpty() ? ImageSource::Dynamic : ImageSource::Fixed;
+        e.imageFolder = o.value("imageFolder").toString();
+        e.matchField = o.value("matchField").toString();
+        // 顯示方式：舊版面檔 -> 貼合內容 = 框高依圖片比例；保持長寬比 = 縮放適應；否則拉伸
+        if (o.contains("imageFit")) e.imageFit = strToFit(o.value("imageFit").toString());
+        else e.imageFit = e.fitContent ? ImageFit::MatchHeight : (e.keepAspect ? ImageFit::Contain : ImageFit::Stretch);
+        e.imageZoomPct = qBound(10.0, o.value("imageZoomPct").toDouble(100.0), 400.0);
+        e.imageFocusX = qBound(0.0, o.value("imageFocusX").toDouble(50.0), 100.0);
+        e.imageFocusY = qBound(0.0, o.value("imageFocusY").toDouble(50.0), 100.0);
+        if (e.type == ElementType::Image) e.fitContent = (e.imageFit == ImageFit::MatchHeight);   // 圖片的 fitContent 與「框高依圖片比例」同步
         return e;
     }
 

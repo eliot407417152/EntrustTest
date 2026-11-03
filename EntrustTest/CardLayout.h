@@ -18,8 +18,28 @@ namespace card {
     enum class ElementType { Text, Image };
     enum class HAlign { Left = 0, Center = 1, Right = 2 };
 
+    // ------------------------------------------------------------ 座標系 ---
+    // 模型 (JSON 版面檔、渲染、鍍膜 Escape) 一律以「卡面左上角」為原點、Y 往下，單位 mm。
+    // 操作介面 (屬性面板 / 尺規 / 游標座標) 則以「卡面左下角」為原點、Y 往上顯示與輸入，
+    // 元素的 (X, Y) = 該元素「左下角」到卡面左下角的距離。兩者只在介面邊界換算，
+    // 所以舊的版面檔與列印流程完全不受影響。
+    //   uiY = cardH - (yMm + hMm)        yMm = cardH - uiY - hMm
+    inline double toUiY(double yMm, double hMm, double cardHMm) { return cardHMm - (yMm + hMm); }
+    inline double fromUiY(double uiY, double hMm, double cardHMm) { return cardHMm - uiY - hMm; }
+    // 只有 Y 座標的點 (游標 / 尺規) 用：
+    inline double flipY(double yMm, double cardHMm) { return cardHMm - yMm; }
+
     // 一筆製卡資料：欄位名稱 -> 值，例如 {"姓名":"王小明"}
     using Record = QMap<QString, QString>;
+
+    // 圖片來源：固定 = 每張卡都用同一張 (imagePath)；動態 = 依每一筆資料在 imageFolder 比對 (見 ImageMatcher.h)
+    enum class ImageSource { Fixed = 0, Dynamic = 1 };
+    // 圖片放進框裡的方式 (框的大小由使用者決定，不會被圖片比例鎖死)：
+    //   Cover       裁切填滿：維持比例放大到蓋滿整個框，超出框的部分裁掉
+    //   Contain     縮放適應：維持比例縮到整張放進框裡 (比例不同時會留白)
+    //   Stretch     拉伸：直接拉成框的大小 (比例會改變)
+    //   MatchHeight 框高依圖片比例：寬度不變，框的高度自動等於 寬 x 圖片長寬比
+    enum class ImageFit { Cover = 0, Contain = 1, Stretch = 2, MatchHeight = 3 };
 
     struct Element {
         QString id;                       // 唯一，例如 e_3
@@ -38,9 +58,20 @@ namespace card {
         QColor color = Qt::black;
         HAlign align = HAlign::Left;
 
-        // 圖片 (路徑可含 {欄位}，階段 2 會接上照片資料夾)
-        QString imagePath;
-        bool keepAspect = true;
+        // 圖片：每個圖片元素各自有一組設定，所以不同的圖片可以用不同的來源 / 資料夾 / 比對欄位。
+        ImageSource imageSource = ImageSource::Dynamic;
+        QString imagePath;                // 固定圖片：路徑 (可含 {欄位})
+        QString imageFolder;              // 動態圖片：圖片資料夾
+        QString matchField;               // 動態圖片：用哪個欄位的值去比對檔名
+        ImageFit imageFit = ImageFit::Cover;
+        double imageZoomPct = 100.0;      // 額外縮放 % (Cover / Contain 才有作用)
+        double imageFocusX = 50.0;        // 圖片在框內的水平位置：0 = 靠左 (裁切時保留左邊) … 100 = 靠右
+        double imageFocusY = 50.0;        // 垂直位置：0 = 靠上 … 100 = 靠下
+        bool keepAspect = true;           // 舊欄位，只為了相容舊版面檔；實際以 imageFit 為準
+
+        // 貼合內容：文字框大小跟隨文字、圖片框高度跟隨圖片比例 (見 CardPainter.h 的 fitElement)。
+        // 預設 false，所以舊版面檔不受影響。
+        bool fitContent = false;
 
         bool isDynamic() const;           // 內容是否含 {欄位}
         QJsonObject toJson() const;

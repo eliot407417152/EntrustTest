@@ -24,6 +24,7 @@
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include "UiScale.h"
 #include <QSpinBox>
 #include <QSplitter>
 #include <QTableWidget>
@@ -80,22 +81,23 @@ namespace {
 
 PrintDialog::PrintDialog(const PrintInput& in, QWidget* parent) : QDialog(parent), in_(in) {
     setWindowTitle(tr("批次列印"));
-    resize(980, 820);
+    uiscale::fitSize(this, 980, 820);       // 依介面大小與螢幕可用範圍決定，不會超出螢幕
 
     // 分析版面：用到哪些欄位、有沒有「自動比對圖片」的圖片元素
     for (const auto& e : in_.layout.elements) {
-        const QString& src = (e.type == card::ElementType::Text) ? e.text : e.imagePath;
-        if (e.type == card::ElementType::Image && e.imagePath.trimmed().isEmpty()) hasAutoImage_ = true;
+        const bool dynImage = e.type == card::ElementType::Image && e.imageSource == card::ImageSource::Dynamic;
+        const QString src = e.type == card::ElementType::Text ? e.text : (dynImage ? QString() : e.imagePath);
+        if (dynImage) {                                            // 每個動態圖片各自統計「比對欄位」的值有沒有重名
+            hasAutoImage_ = true;
+            QHash<QString, int>& cnt = matchValueCount_[e.id];
+            for (const auto& rec : in_.data.rows) {
+                const QString k = rec.value(e.matchField).trimmed().toLower();
+                if (!k.isEmpty()) cnt[k]++;
+            }
+        }
         auto it = placeholderRe().globalMatch(src);
         while (it.hasNext()) usedFields_.insert(it.next().captured(1));
     }
-    if (hasAutoImage_) {
-        for (const auto& rec : in_.data.rows) {
-            const QString k = rec.value(in_.matchField).trimmed().toLower();
-            if (!k.isEmpty()) matchValueCount_[k]++;
-        }
-    }
-
     buildUi();
     loadSettings();
     updateModeUi();
@@ -241,7 +243,7 @@ void PrintDialog::buildUi() {
     progress_->setFormat(QStringLiteral("%v / %m"));
     prog->addWidget(progress_, 1);
     timeLabel_ = new QLabel;
-    timeLabel_->setMinimumWidth(240);
+    timeLabel_->setMinimumWidth(uiscale::px(240));
     prog->addWidget(timeLabel_);
     root->addLayout(prog);
     currentLabel_ = new QLabel(tr("尚未開始"));
@@ -449,30 +451,29 @@ QStringList PrintDialog::problemsOf(int row) const {
         else if (rec.value(f).trimmed().isEmpty()) p << tr("「%1」無資料").arg(f);
     }
 
-    for (const auto& e : in_.layout.elements) {                       // 指定路徑的圖片
-        if (e.type != card::ElementType::Image || e.imagePath.trimmed().isEmpty()) continue;
-        const QString path = card::substitute(e.imagePath, rec);
-        if (!QFileInfo::exists(path)) p << tr("找不到圖片檔：%1").arg(path);
-    }
-
-    if (hasAutoImage_) {                                              // 依資料夾自動比對的圖片
-        if (!in_.matcher.hasFolder()) {
-            p << tr("尚未設定圖片資料夾");
+    for (const auto& e : in_.layout.elements) {                       // 圖片：每個圖片元素各自檢查
+        if (e.type != card::ElementType::Image) continue;
+        const QString who = tr("圖片「%1」").arg(e.name);
+        if (e.imageSource == card::ImageSource::Fixed) {              // 固定圖片
+            if (e.imagePath.trimmed().isEmpty()) { p << tr("%1 未指定圖片檔").arg(who); continue; }
+            const QString path = card::substitute(e.imagePath, rec);
+            if (!QFileInfo::exists(path)) p << tr("%1 找不到圖片檔：%2").arg(who, path);
+            continue;
         }
-        else {
-            const QString value = rec.value(in_.matchField);
-            const card::ImageMatch m = in_.matcher.find(value);
-            switch (m.status) {
-            case card::ImageMatch::NoValue:
-                if (!usedFields_.contains(in_.matchField)) p << tr("「%1」無資料，無法比對圖片").arg(in_.matchField);
-                break;
-            case card::ImageMatch::NotFound:  p << tr("找不到圖片"); break;
-            case card::ImageMatch::Ambiguous: p << tr("%1 張圖片符合 (重名)").arg(m.candidates.size()); break;
-            default: break;
-            }
-            const int same = matchValueCount_.value(value.trimmed().toLower());
-            if (same > 1) p << tr("資料重名 ×%1，無法確定是哪張圖").arg(same);
+        const QString folderProblem = in_.imagePool.folderProblem(e.imageFolder);   // 動態圖片：依它自己的資料夾與比對欄位
+        if (!folderProblem.isEmpty()) { p << tr("%1 %2").arg(who, folderProblem); continue; }
+        const QString value = rec.value(e.matchField);
+        const card::ImageMatch m = in_.imagePool.match(e.imageFolder, value);
+        switch (m.status) {
+        case card::ImageMatch::NoValue:
+            if (!usedFields_.contains(e.matchField)) p << tr("%1 的比對欄位「%2」無資料，無法比對圖片").arg(who, e.matchField);
+            break;
+        case card::ImageMatch::NotFound:  p << tr("%1 找不到圖片").arg(who); break;
+        case card::ImageMatch::Ambiguous: p << tr("%1 有 %2 張圖片符合 (重名)").arg(who).arg(m.candidates.size()); break;
+        default: break;
         }
+        const int same = matchValueCount_.value(e.id).value(value.trimmed().toLower());
+        if (same > 1) p << tr("%1 資料重名 ×%2，無法確定是哪張圖").arg(who).arg(same);
     }
     return p;
 }
@@ -705,9 +706,11 @@ void PrintDialog::startJob() {
 QString PrintDialog::renderItem(int itemIndex, int dpi, bool dryRun, const QString& outDir, QString* error) {
     const Item& it = items_[itemIndex];
     card::Record rec = in_.data.rows[it.row];
-    in_.matcher.applyTo(rec, in_.matchField);                 // 帶入依資料夾比對到的圖片
+    in_.imagePool.applyTo(rec, in_.layout);                   // 帶入各動態圖片 (依它自己的資料夾與欄位) 比對到的圖片
 
-    QImage img = card::renderCard(in_.layout, rec, dpi);
+    card::CardLayout lay = in_.layout;                        // 每一筆資料的內容不同：複製一份版面再依該筆貼合
+    card::fitAll(lay, rec);
+    QImage img = card::renderCard(lay, rec, dpi);
     if (img.isNull()) { *error = tr("卡面渲染失敗"); return QString(); }
 
     QString path;
@@ -872,8 +875,13 @@ QString PrintDialog::settingsSummary() const {
     if (!dryCheck_->isChecked())
         l << tr("鍍膜：%1").arg(topcoatForPrinter().isDefault() ? tr("不送出 (沿用驅動程式設定)")
             : QString::fromStdWString(topcoat::describe(topcoatForPrinter())));
-    l << tr("圖片比對：資料夾 %1；比對欄位 %2")
-        .arg(in_.matcher.hasFolder() ? in_.matcher.folder() : tr("(未設定)"), in_.matchField);
+    for (const auto& e : in_.layout.elements) {
+        if (e.type != card::ElementType::Image) continue;
+        if (e.imageSource == card::ImageSource::Fixed)
+            l << tr("圖片「%1」：固定 %2").arg(e.name, e.imagePath.isEmpty() ? tr("(未指定)") : e.imagePath);
+        else
+            l << tr("圖片「%1」：依資料比對，資料夾 %2；比對欄位 %3").arg(e.name, e.imageFolder.isEmpty() ? tr("(未設定)") : e.imageFolder, e.matchField);
+    }
     l << tr("略過有問題的資料：%1").arg(skipCheck_->isChecked() ? tr("是") : tr("否"));
     return l.join(QLatin1Char('\n'));
 }

@@ -34,8 +34,7 @@ class QTableWidget;
 struct PrintInput {
     card::CardLayout layout;
     card::DataTable data;            // 要列印的資料 (未載入 Excel 時，只有 1 筆「預覽資料」)
-    card::ImageMatcher matcher;      // 圖片資料夾 (圖片路徑留空的圖片元素使用)
-    QString matchField;              // 用哪個欄位比對圖片檔名
+    card::ImageMatcherPool imagePool;   // 各「動態圖片」元素用到的圖片資料夾 (已掃描)；每個元素有自己的資料夾與比對欄位
     QList<int> visibleRows;          // 資料表目前顯示的列 (受搜尋條件過濾)
     int currentRow = -1;             // 資料表目前選取的列
     bool previewOnly = false;        // true = 沒有載入 Excel，資料是「預覽資料」欄位的內容
@@ -96,8 +95,8 @@ private:
 
     PrintInput in_;
     QSet<QString> usedFields_;                 // 版面中 {欄位} 用到的欄位
-    bool hasAutoImage_ = false;                // 有「圖片路徑留空」的圖片元素 (依資料夾自動比對)
-    QHash<QString, int> matchValueCount_;      // 比對欄位的值在整份資料出現幾次 (偵測資料重名)
+    bool hasAutoImage_ = false;                // 有「動態圖片」元素 (依資料帶入)
+    QHash<QString, QHash<QString, int>> matchValueCount_;   // 動態圖片元素 id -> (比對欄位的值 -> 在整份資料出現幾次，偵測資料重名)
 
     QList<Item> items_;
     QList<int> retryRows_;

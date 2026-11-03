@@ -29,6 +29,7 @@ class QListWidget;
 class QPlainTextEdit;
 class QPushButton;
 class QShowEvent;
+class QCloseEvent;
 class QTimer;
 class QTableWidget;
 class ElementItem;
@@ -37,6 +38,7 @@ class RegionItem;
 class DesignerWindow : public QMainWindow {
 public:
     explicit DesignerWindow(QWidget* parent = nullptr);
+    ~DesignerWindow() override;
 
     // 載入 Excel 製卡資料 (成功回傳 true；失敗會跳出訊息視窗)
     bool loadData(const QString& path);
@@ -46,6 +48,7 @@ public:
 
 protected:
     void showEvent(QShowEvent* ev) override;
+    void closeEvent(QCloseEvent* ev) override;     // 記住視窗位置、大小與面板配置
 
 private:
     // UI 建立
@@ -56,6 +59,8 @@ private:
     QWidget* buildDataPanel();
     QWidget* buildTopcoatPanel();
     void resetDockLayout();
+    void applyUiScale();                   // 介面大小改變後，更新所有寫死像素尺寸的元件
+    void fitWindowToScreen();              // 視窗適應螢幕 (並還原面板配置)
     void applyDockSizes();
     void updateActionStates();
 
@@ -109,9 +114,10 @@ private:
     void updateDataInfo();
 
     // 圖片自動對應 (階段 2)
-    void browseImageFolder();
-    void refreshImageMatches();            // 重算「圖片」欄、統計，並更新預覽
-    QString matchField() const;
+    void refreshImageMatches(bool force = true);   // 重算「圖片」欄、統計，並更新預覽 (force = false 時，沒變動就略過)
+    const card::Element* imageTarget();    // 「圖片」欄 / 統計顯示哪個圖片元素的比對結果
+    void onImageSourceChanged();           // 圖片的來源 / 資料夾 / 比對欄位改變後：重新掃描、比對、更新預覽與面板
+    void migrateLegacyImageSettings(card::CardLayout& lay);   // 舊版 (全域圖片資料夾) -> 每個圖片元素自己的設定
 
     // 面板與清單
     void populatePanel(const card::Element* e);
@@ -122,6 +128,7 @@ private:
     void onItemChanged(const QString& id);
     void editSelected(const std::function<void(card::Element&)>& fn);
     void applyPreviewRecord();
+    void refitAll();                       // 預覽資料改變後，重新貼合所有「貼合內容」的元素
     void updateColorButton(const QColor& c);
 
     card::CardLayout layout_;
@@ -135,6 +142,10 @@ private:
     card::Record previewRecord_;           // 場景內的元素都指向這個物件
     bool updating_ = false;                // 避免「程式更新控制項」又觸發「使用者編輯」
     bool shownOnce_ = false;
+    bool restoredState_ = false;           // 已還原上次的面板配置 (就不要再套用預設面板大小)
+    QLabel* cornerLabel_ = nullptr;        // 兩條尺規交會處的 "mm"
+    QWidget* topcoatPanel_ = nullptr;
+    std::vector<QAction*> scaleActs_;      // 「介面大小」選單的各個選項 (data = 百分比，0 = 自動)
 
     QGraphicsScene* scene_ = nullptr;
     CardView* view_ = nullptr;
@@ -173,6 +184,7 @@ private:
     QDoubleSpinBox* ySpin_ = nullptr;
     QDoubleSpinBox* wSpin_ = nullptr;
     QDoubleSpinBox* hSpin_ = nullptr;
+    QCheckBox* fitCheck_ = nullptr;        // 貼合內容
     QGroupBox* textGroup_ = nullptr;
     QPlainTextEdit* textEdit_ = nullptr;
     QComboBox* fieldCombo_ = nullptr;
@@ -184,7 +196,16 @@ private:
     QPushButton* colorBtn_ = nullptr;
     QGroupBox* imageGroup_ = nullptr;
     QLineEdit* imageEdit_ = nullptr;
-    QCheckBox* keepAspectCheck_ = nullptr;
+    QComboBox* imageSourceCombo_ = nullptr;   // 固定圖片 / 動態圖片
+    QWidget* imageFixedBox_ = nullptr;        // 固定圖片的設定 (路徑)
+    QWidget* imageDynBox_ = nullptr;          // 動態圖片的設定 (資料夾、比對欄位)
+    QLineEdit* imageFolderEdit_ = nullptr;
+    QComboBox* matchFieldCombo_ = nullptr;
+    QLabel* imageSummary_ = nullptr;
+    QComboBox* imageFitCombo_ = nullptr;      // 圖片顯示方式：裁切 / 縮放 / 拉伸 / 框高依圖片比例
+    QDoubleSpinBox* imageZoomSpin_ = nullptr;
+    QDoubleSpinBox* imageFocusXSpin_ = nullptr;
+    QDoubleSpinBox* imageFocusYSpin_ = nullptr;
 
     // 鍍膜面板
     QComboBox* topBaseCombo_ = nullptr;
@@ -210,8 +231,6 @@ private:
     QString lastDataDir_;
 
     // 圖片自動對應
-    card::ImageMatcher imageMatcher_;
-    QLineEdit* imageDirEdit_ = nullptr;
-    QComboBox* matchFieldCombo_ = nullptr;
-    QLabel* imageSummary_ = nullptr;
+    card::ImageMatcherPool imagePool_;     // 各動態圖片元素用到的圖片資料夾 (相同資料夾只掃描一次)
+    QString lastImageRefreshKey_;          // 上次計算「圖片」欄時的條件 (沒變就不重算)
 };

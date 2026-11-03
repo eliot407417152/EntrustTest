@@ -12,6 +12,7 @@
 #include <functional>
 #include <vector>
 #include "CardLayout.h"
+#include "UiScale.h"
 
 namespace card {
 
@@ -113,7 +114,7 @@ namespace card {
 
     // 把手大小 (場景 px)：約 9 個螢幕像素，小元素會自動縮小，免得把手互相蓋住
     inline double handleSizePx(double viewScale, const QRectF& r) {
-        double s = 9.0 / std::max(viewScale, 0.05);
+        double s = 9.0 * uiscale::factor() / std::max(viewScale, 0.05);   // 約 9 個螢幕像素 (隨介面大小縮放)
         s = std::min(s, std::min(r.width(), r.height()) / 3.5);
         return std::max(s, 2.0);
     }

@@ -15,6 +15,17 @@ namespace card {
 	// 把整張卡渲染成影像 (dpi 例如 300 / 600)。階段 3 列印時會用它。
 	QImage renderCard(const CardLayout& layout, const Record& rec, int dpi);
 
+	// 貼合內容 (Element::fitContent)：依「這一筆資料」把元素的框調成剛好包住內容。
+	//   文字：寬 = 文字的實際寬度 (不換行)，高 = 行數 x 行高；
+	//         依對齊方式固定錨點 (靠左固定左邊、置中固定中心、靠右固定右邊)，底邊固定不動。
+	//   圖片：寬度不變，高度 = 寬度 x 圖片長寬比；底邊固定不動 (往上長高 / 縮短)。
+	//         找不到圖片時不改變。
+	// 回傳框是否有改變。預覽 (編輯器) 與列印 (每一筆資料) 都用同一個函式，所以兩邊一致。
+	bool fitElement(Element& e, const Record& rec);
+
+	// 對版面中所有 fitContent 的元素套用 fitElement
+	void fitAll(CardLayout& layout, const Record& rec);
+
 	// 圖片有快取；檔案內容改變後可呼叫此函式清除
 	void clearImageCache();
 
