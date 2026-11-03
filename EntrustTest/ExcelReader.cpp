@@ -518,4 +518,84 @@ namespace card {
         return true;
     }
 
+    QString excelColumnName(int index) {
+        QString s;
+        for (int n = index + 1; n > 0; n = (n - 1) / 26)
+            s.prepend(QChar(ushort('A' + (n - 1) % 26)));
+        return s;
+    }
+
+    int detectHeaderRow(const QList<QStringList>& raw) {
+        const int scan = qMin(30, int(raw.size()));
+        QList<int> counts;
+        int maxCount = 0;
+        for (int r = 0; r < scan; ++r) {
+            int cnt = 0;
+            for (const QString& s : raw[r]) if (!s.trimmed().isEmpty()) ++cnt;
+            counts << cnt;
+            maxCount = qMax(maxCount, cnt);
+        }
+        if (maxCount == 0) return -1;
+        for (int r = 0; r < scan; ++r)
+            if (counts[r] > 0 && counts[r] * 10 >= maxCount * 7) return r;
+        return -1;
+    }
+
+    QStringList importFields(const QList<QStringList>& raw, int headerRow, QList<int>* columnIndexes) {
+        QStringList fields;
+        QList<int> cols;
+        if (headerRow >= 0 && headerRow < raw.size()) {
+            const QStringList& head = raw[headerRow];
+            int width = int(head.size());
+            for (int r = headerRow + 1; r < raw.size(); ++r) width = qMax(width, int(raw[r].size()));
+
+            for (int c = 0; c < width; ++c) {
+                QString name = (c < head.size()) ? head[c].trimmed() : QString();
+                name.replace(QLatin1Char('{'), QLatin1Char('(')).replace(QLatin1Char('}'), QLatin1Char(')'));
+                if (name.isEmpty()) {
+                    bool hasData = false;
+                    for (int r = headerRow + 1; r < raw.size(); ++r)
+                        if (c < raw[r].size() && !raw[r][c].trimmed().isEmpty()) { hasData = true; break; }
+                    if (!hasData) continue;                                   // 整欄空白：略過
+                    name = QStringLiteral("欄") + excelColumnName(c);
+                }
+                QString unique = name;
+                for (int n = 2; fields.contains(unique); ++n)
+                    unique = QStringLiteral("%1(%2)").arg(name).arg(n);
+                fields << unique;
+                cols << c;
+            }
+        }
+        if (columnIndexes) *columnIndexes = cols;
+        return fields;
+    }
+
+    bool buildDataTableAll(const QList<QStringList>& raw, int headerRow, const QString& path,
+        DataTable* out, QString* error) {
+        auto fail = [error](const QString& m) { if (error) *error = m; return false; };
+
+        if (headerRow < 0 || headerRow >= raw.size()) return fail(QStringLiteral("標題列超出工作表範圍"));
+        QList<int> cols;
+        const QStringList fields = importFields(raw, headerRow, &cols);
+        if (fields.isEmpty()) return fail(QStringLiteral("標題列沒有任何欄位名稱，請確認標題列是第幾列"));
+
+        DataTable t;
+        t.path = path;
+        t.fields = fields;
+        for (int r = headerRow + 1; r < raw.size(); ++r) {
+            Record rec;
+            bool any = false;
+            for (int i = 0; i < fields.size(); ++i) {
+                const int c = cols[i];
+                const QString v = (c < raw[r].size()) ? raw[r][c].trimmed() : QString();
+                if (!v.isEmpty()) any = true;
+                rec.insert(fields[i], v);
+            }
+            if (any) t.rows.append(rec);
+            else ++t.skippedBlankRows;
+        }
+        *out = t;
+        return true;
+    }
+
 } // namespace card

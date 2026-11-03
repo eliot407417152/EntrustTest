@@ -15,6 +15,8 @@ class QCheckBox;
 class QComboBox;
 class QDockWidget;
 class QDoubleSpinBox;
+class QGraphicsItem;
+class QFormLayout;
 class QFontComboBox;
 class QGraphicsRectItem;
 class QGraphicsScene;
@@ -58,6 +60,7 @@ private:
     QWidget* buildPreviewPanel();
     QWidget* buildDataPanel();
     QWidget* buildTopcoatPanel();
+    QWidget* buildBackgroundPanel();
     void resetDockLayout();
     void applyUiScale();                   // 介面大小改變後，更新所有寫死像素尺寸的元件
     void fitWindowToScreen();              // 視窗適應螢幕 (並還原面板配置)
@@ -106,12 +109,22 @@ private:
     void onRegionItemChanged(const QString& id);
     void refreshTopcoatPreview();
 
+    // 卡面底圖：匯入卡面的圖當設計參考，可選擇列印時印出或不印出
+    void importBackground();
+    void clearBackground();
+    void editBackground(const std::function<void(card::CardBackground&)>& fn);
+    void refreshBackgroundPanel();                 // 依 layout_.background 重新填入「卡面底圖」面板
+
     // 製卡資料 (階段 2)
     void browseData();
     void applyDataRow(int row);
     void stepRecord(int delta);
     void applyDataFilter(const QString& text);
     void updateDataInfo();
+    QStringList currentFields() const;     // 目前可用的欄位：載入 Excel 後 = Excel 的所有欄位；尚未載入 = 預設範例欄位
+    QStringList layoutFields() const;      // 版面實際用到的欄位 (文字的 {欄位}、固定圖片路徑的 {欄位}、動態圖片的比對欄位)
+    void rebuildFieldWidgets();            // 載入資料後，依 Excel 欄位重建：插入欄位 / 圖片比對欄位 / 預覽資料 / 資料表欄
+    void rebuildPreviewForm();             // 重建右側「預覽資料」的欄位輸入框
 
     // 圖片自動對應 (階段 2)
     void refreshImageMatches(bool force = true);   // 重算「圖片」欄、統計，並更新預覽 (force = false 時，沒變動就略過)
@@ -145,6 +158,8 @@ private:
     bool restoredState_ = false;           // 已還原上次的面板配置 (就不要再套用預設面板大小)
     QLabel* cornerLabel_ = nullptr;        // 兩條尺規交會處的 "mm"
     QWidget* topcoatPanel_ = nullptr;
+    QWidget* backgroundPanel_ = nullptr;
+    QGraphicsItem* bgItem_ = nullptr;      // 場景中的卡面底圖 (最底層，不能選取 / 拖曳)
     std::vector<QAction*> scaleActs_;      // 「介面大小」選單的各個選項 (data = 百分比，0 = 自動)
 
     QGraphicsScene* scene_ = nullptr;
@@ -162,6 +177,7 @@ private:
     QDockWidget* propertyDock_ = nullptr;
     QDockWidget* previewDock_ = nullptr;
     QDockWidget* topcoatDock_ = nullptr;
+    QDockWidget* backgroundDock_ = nullptr;
 
     // 動作 (需要隨狀態啟用/停用的)
     QAction* actUndo_ = nullptr;
@@ -173,6 +189,8 @@ private:
     QAction* actPortrait_ = nullptr;
     QAction* actShowRegions_ = nullptr;
     QAction* actSnap_ = nullptr;
+    QAction* actImportBg_ = nullptr;
+    QAction* actClearBg_ = nullptr;
 
     QListWidget* elementList_ = nullptr;
 
@@ -219,9 +237,20 @@ private:
     QDoubleSpinBox* rhSpin_ = nullptr;
     QPlainTextEdit* topcoatPreview_ = nullptr;
 
+    // 卡面底圖面板
+    QLineEdit* bgPathEdit_ = nullptr;
+    QLabel* bgInfoLabel_ = nullptr;
+    QComboBox* bgFitCombo_ = nullptr;
+    QDoubleSpinBox* bgFocusXSpin_ = nullptr;
+    QDoubleSpinBox* bgFocusYSpin_ = nullptr;
+    QCheckBox* bgShowCheck_ = nullptr;
+    QCheckBox* bgPrintCheck_ = nullptr;
+    QPushButton* bgClearBtn_ = nullptr;
+
     // 預覽資料
     QCheckBox* usePreviewCheck_ = nullptr;
     std::vector<std::pair<QString, QLineEdit*>> previewEdits_;
+    QFormLayout* previewForm_ = nullptr;
 
     // 製卡資料
     card::DataTable data_;

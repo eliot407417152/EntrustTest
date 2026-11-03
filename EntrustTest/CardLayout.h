@@ -112,8 +112,27 @@ namespace card {
         static TopcoatSettings fromJson(const QJsonObject& o);
     };
 
+    // ------------------------------------------------------------ 卡面底圖 ---
+    // 匯入「卡面的圖」(例如已設計好的卡面樣板)，設計時墊在所有元素的最底層，方便對位文字與圖片。
+    //   print = false (預設)：只在設計畫面顯示當參考，預覽輸出 / 列印時不會印出。
+    //   print = true        ：渲染卡面時會先畫這張底圖，再疊上各元素 (預覽輸出 / 批次列印都會印出)。
+    // 一律鋪滿整張卡面；路徑可含 {欄位}，這樣不同資料可以用不同的卡面。
+    struct CardBackground {
+        QString path;                     // 圖片檔路徑 (空字串 = 沒有底圖)
+        ImageFit fit = ImageFit::Cover;   // Cover / Contain / Stretch (不使用 MatchHeight)
+        double focusX = 50.0;             // 裁切 / 留白時圖片的水平位置 0 ~ 100 %
+        double focusY = 50.0;             // 垂直位置 0 ~ 100 %
+        bool showInDesigner = true;       // 設計畫面是否顯示 (只影響編輯畫面)
+        bool print = false;               // 是否印出
+
+        bool isEmpty() const { return path.trimmed().isEmpty(); }
+        QJsonObject toJson() const;
+        static CardBackground fromJson(const QJsonObject& o);
+    };
+
     struct CardLayout {
         Orientation orientation = Orientation::Landscape;
+        CardBackground background;        // 卡面底圖 (舊版面檔沒有這一項 = 無底圖)
         QList<Element> elements;          // 順序 = 疊放順序 (後面的在上層)
         TopcoatSettings topcoat;          // 鍍膜設定 (舊版面檔沒有這一項 = 沿用驅動程式設定)
 

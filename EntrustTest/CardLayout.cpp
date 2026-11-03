@@ -213,6 +213,31 @@ namespace card {
         return t;
     }
 
+    // ------------------------------------------------------------- 卡面底圖 ---
+
+    QJsonObject CardBackground::toJson() const {
+        QJsonObject o;
+        o["path"] = path;
+        o["fit"] = fitToStr(fit);
+        o["focusX"] = focusX;
+        o["focusY"] = focusY;
+        o["showInDesigner"] = showInDesigner;
+        o["print"] = print;
+        return o;
+    }
+
+    CardBackground CardBackground::fromJson(const QJsonObject& o) {
+        CardBackground b;
+        b.path = o.value("path").toString();
+        b.fit = strToFit(o.value("fit").toString());
+        if (b.fit == ImageFit::MatchHeight) b.fit = ImageFit::Cover;
+        b.focusX = qBound(0.0, o.value("focusX").toDouble(50.0), 100.0);
+        b.focusY = qBound(0.0, o.value("focusY").toDouble(50.0), 100.0);
+        b.showInDesigner = o.value("showInDesigner").toBool(true);
+        b.print = o.value("print").toBool(false);
+        return b;
+    }
+
     // --------------------------------------------------------------- CardLayout ---
 
     double CardLayout::widthMm() const {
@@ -245,6 +270,7 @@ namespace card {
         QJsonArray arr;
         for (const auto& e : elements) arr.append(e.toJson());
         o["elements"] = arr;
+        if (!background.isEmpty()) o["background"] = background.toJson();   // 沒有底圖就不寫出，版面檔維持精簡
         if (!topcoat.isDefault()) o["topcoat"] = topcoat.toJson();       // 預設值不寫出，版面檔維持精簡
         return o;
     }
@@ -259,6 +285,7 @@ namespace card {
             if (e.id.isEmpty() || l.find(e.id)) e.id = l.nextId();   // 避免缺 id 或重複
             l.elements.append(e);
         }
+        l.background = CardBackground::fromJson(o.value("background").toObject());   // 舊版面檔沒有 = 無底圖
         l.topcoat = TopcoatSettings::fromJson(o.value("topcoat").toObject());   // 舊版面檔沒有 = 預設
         return l;
     }

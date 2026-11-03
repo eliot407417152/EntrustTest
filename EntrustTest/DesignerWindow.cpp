@@ -12,6 +12,8 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -20,12 +22,14 @@
 #include <QFontComboBox>
 #include <QFormLayout>
 #include <QGridLayout>
+#include <QGraphicsItem>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsView>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHash>
+#include <QImageReader>
 #include <QHeaderView>
 #include <QLabel>
 #include <QSizePolicy>
@@ -38,7 +42,10 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QRegularExpression>
+#include <QSet>
 #include <QSettings>
+#include <QSpinBox>
 #include <QCloseEvent>
 #include <QPointer>
 #include <QToolButton>
@@ -51,6 +58,88 @@
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QWheelEvent>
+
+// ================================================== 載入 Excel：確認標題列 ===
+// 每個客戶的 Excel 欄位都可能不同：標題列下所有欄位都會匯入，
+// 之後文字、圖片可以任選其中的欄位當參考。這裡只需確認「哪一列是欄位標題」。
+namespace {
+
+    class HeaderRowDialog : public QDialog {
+    public:
+        HeaderRowDialog(const QString& path, const QList<QStringList>& raw, QWidget* parent)
+            : QDialog(parent), raw_(raw) {
+            setWindowTitle(tr("載入製卡資料"));
+
+            auto* v = new QVBoxLayout(this);
+            auto* info = new QLabel(tr("檔案：%1\n會讀入此 Excel 的所有欄位，之後文字與圖片都可以任選其中的欄位當參考。\n請確認哪一列是欄位標題：")
+                .arg(QFileInfo(path).fileName()));
+            info->setWordWrap(true);
+            v->addWidget(info);
+
+            auto* rowForm = new QFormLayout;
+            headerSpin_ = new QSpinBox;
+            headerSpin_->setRange(1, qMax(1, qMin(30, int(raw_.size()))));
+            headerSpin_->setValue(qMax(0, card::detectHeaderRow(raw_)) + 1);
+            rowForm->addRow(tr("標題列 (第幾列)："), headerSpin_);
+            v->addLayout(rowForm);
+
+            summary_ = new QLabel;
+            summary_->setWordWrap(true);
+            v->addWidget(summary_);
+
+            v->addWidget(new QLabel(tr("資料預覽 (標題列之後的前 8 列)：")));
+            preview_ = new QTableWidget;
+            preview_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+            preview_->setSelectionMode(QAbstractItemView::NoSelection);
+            preview_->setMinimumHeight(180);
+            v->addWidget(preview_, 1);
+
+            auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+            okBtn_ = bb->button(QDialogButtonBox::Ok);
+            v->addWidget(bb);
+            connect(bb, &QDialogButtonBox::accepted, this, [this] { accept(); });
+            connect(bb, &QDialogButtonBox::rejected, this, [this] { reject(); });
+            connect(headerSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this] { refresh(); });
+
+            refresh();
+            resize(720, 520);
+        }
+
+        int headerRow() const { return headerSpin_->value() - 1; }      // 0 起算
+
+    private:
+        void refresh() {
+            const int hr = headerRow();
+            QList<int> cols;
+            const QStringList fields = card::importFields(raw_, hr, &cols);
+            okBtn_->setEnabled(!fields.isEmpty());
+            summary_->setText(fields.isEmpty()
+                ? tr("這一列沒有任何欄位標題，請換一列。")
+                : tr("將讀入 %1 個欄位：%2").arg(fields.size()).arg(fields.join(QStringLiteral("、"))));
+
+            const int nRows = qMax(0, qMin(8, int(raw_.size()) - hr - 1));
+            preview_->clear();
+            preview_->setColumnCount(int(fields.size()));
+            preview_->setRowCount(nRows);
+            preview_->setHorizontalHeaderLabels(fields);
+            for (int r = 0; r < nRows; ++r) {
+                const QStringList& row = raw_[hr + 1 + r];
+                for (int i = 0; i < fields.size(); ++i) {
+                    const int c = cols[i];
+                    preview_->setItem(r, i, new QTableWidgetItem(c < row.size() ? row[c].trimmed() : QString()));
+                }
+            }
+            preview_->resizeColumnsToContents();
+        }
+
+        QList<QStringList> raw_;
+        QSpinBox* headerSpin_ = nullptr;
+        QLabel* summary_ = nullptr;
+        QTableWidget* preview_ = nullptr;
+        QPushButton* okBtn_ = nullptr;
+    };
+
+} // namespace
 
 namespace {
 
@@ -75,7 +164,29 @@ namespace {
             " padding:%2px %3px; border-radius:%4px; } QToolButton:hover { background:#26994c; }")
             .arg(px(13)).arg(px(6)).arg(px(22)).arg(px(4));
     }
-    constexpr int kWindowStateVersion = 1;
+    constexpr int kWindowStateVersion = 2;       // 2：新增「卡面底圖」面板 (舊的面板配置不相容，會回到預設配置)
+
+    // 卡面底圖：卡片的最底層，只負責顯示 (滑鼠點擊會穿透到下面，不會干擾元素的選取與拖曳)。
+    // 是否印出由 CardBackground::print 決定，與這裡的顯示無關 (見 renderCard)。
+    class BackgroundItem : public QGraphicsItem {
+    public:
+        BackgroundItem(const card::CardLayout* layout, const card::Record* rec, QGraphicsItem* parent)
+            : QGraphicsItem(parent), layout_(layout), rec_(rec) {
+            setAcceptedMouseButtons(Qt::NoButton);
+            setZValue(-1000);
+        }
+        QRectF boundingRect() const override {
+            return QRectF(0, 0, layout_->widthMm() * ElementItem::kPxPerMm, layout_->heightMm() * ElementItem::kPxPerMm);
+        }
+        void paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) override {
+            const card::CardBackground& bg = layout_->background;
+            if (bg.isEmpty() || !bg.showInDesigner) return;
+            card::paintBackground(*p, bg, boundingRect(), ElementItem::kPxPerMm, *rec_);
+        }
+    private:
+        const card::CardLayout* layout_;
+        const card::Record* rec_;
+    };
 
     QString typeText(const card::Element& e) {
         return e.type == card::ElementType::Text ? QStringLiteral("文字") : QStringLiteral("圖片");
@@ -268,6 +379,16 @@ void DesignerWindow::buildUi() {
         topcoatDock_->setWidget(sa);
     }
 
+    backgroundDock_ = new QDockWidget(tr("卡面底圖"), this);
+    backgroundDock_->setObjectName(QStringLiteral("dockBackground"));
+    {
+        auto* sa = new QScrollArea;
+        sa->setWidgetResizable(true);
+        sa->setFrameShape(QFrame::NoFrame);
+        sa->setWidget(buildBackgroundPanel());
+        backgroundDock_->setWidget(sa);
+    }
+
     previewDock_ = new QDockWidget(tr("預覽資料"), this);
     previewDock_->setObjectName(QStringLiteral("dockPreview"));
     {
@@ -295,7 +416,7 @@ void DesignerWindow::buildUi() {
 
 // 面板配置：左=製卡資料；右(由上到下)=元素清單、屬性/鍍膜範圍(分頁)、預覽資料
 void DesignerWindow::resetDockLayout() {
-    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ }) {
+    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, backgroundDock_, previewDock_ }) {
         d->setFloating(false);
         removeDockWidget(d);
     }
@@ -304,9 +425,10 @@ void DesignerWindow::resetDockLayout() {
     addDockWidget(Qt::RightDockWidgetArea, elementDock_);
     splitDockWidget(elementDock_, propertyDock_, Qt::Vertical);
     splitDockWidget(propertyDock_, previewDock_, Qt::Vertical);
-    tabifyDockWidget(propertyDock_, topcoatDock_);           // 「屬性」與「鍍膜範圍」疊成分頁
+    tabifyDockWidget(propertyDock_, topcoatDock_);           // 「屬性」、「鍍膜範圍」、「卡面底圖」疊成分頁
+    tabifyDockWidget(topcoatDock_, backgroundDock_);
 
-    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ }) d->show();
+    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, backgroundDock_, previewDock_ }) d->show();
     propertyDock_->raise();
     applyDockSizes();
 }
@@ -350,7 +472,7 @@ void DesignerWindow::buildMenus() {
     connect(actLandscape_, &QAction::triggered, this, [this] { setOrientation(card::Orientation::Landscape); });
     connect(actPortrait_, &QAction::triggered, this, [this] { setOrientation(card::Orientation::Portrait); });
 
-    auto* actLoadData = newAction(this, tr("載入 Excel 資料"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), tr("載入 .xlsx：姓名、學號、系所、內碼、外碼"), [this] { browseData(); });
+    auto* actLoadData = newAction(this, tr("載入 Excel 資料"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), tr("載入 .xlsx：讀入所有欄位，文字與圖片可任選其中的欄位"), [this] { browseData(); });
     actPrevRecord_ = newAction(this, tr("◀ 上一筆"), QKeySequence(Qt::ALT | Qt::Key_Left), tr("預覽上一筆資料 (Alt+←)"), [this] { stepRecord(-1); });
     actNextRecord_ = newAction(this, tr("下一筆 ▶"), QKeySequence(Qt::ALT | Qt::Key_Right), tr("預覽下一筆資料 (Alt+→)"), [this] { stepRecord(+1); });
 
@@ -380,9 +502,15 @@ void DesignerWindow::buildMenus() {
     mEdit->addSeparator();
     mEdit->addAction(actDelete_);
 
+    actImportBg_ = newAction(this, tr("匯入卡面底圖…"), QKeySequence(), tr("匯入卡面的圖，墊在最底層方便對位文字與圖片；可選擇列印時印出或不印出"), [this] { importBackground(); });
+    actClearBg_ = newAction(this, tr("移除卡面底圖"), QKeySequence(), tr("移除目前的卡面底圖"), [this] { clearBackground(); });
+
     QMenu* mCard = menuBar()->addMenu(tr("卡面(&C)"));
     mCard->addAction(actLandscape_);
     mCard->addAction(actPortrait_);
+    mCard->addSeparator();
+    mCard->addAction(actImportBg_);
+    mCard->addAction(actClearBg_);
 
     QMenu* mData = menuBar()->addMenu(tr("資料(&D)"));
     mData->addAction(actLoadData);
@@ -411,7 +539,7 @@ void DesignerWindow::buildMenus() {
     mView->addAction(actSnap_);
     mView->addSeparator();
     QMenu* mPanels = mView->addMenu(tr("面板"));
-    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, previewDock_ })
+    for (QDockWidget* d : { elementDock_, dataDock_, propertyDock_, topcoatDock_, backgroundDock_, previewDock_ })
         mPanels->addAction(d->toggleViewAction());       // 面板被關掉後，從這裡重新開啟
     mView->addAction(actResetDocks);
 
@@ -558,7 +686,7 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     auto* tf = new QFormLayout(textGroup_);
     textEdit_ = new QPlainTextEdit;
     textEdit_->setFixedHeight(uiscale::px(64));
-    textEdit_->setPlaceholderText(tr("固定文字，或用 {姓名} 這類欄位當動態內容"));
+    textEdit_->setPlaceholderText(tr("固定文字，或用 {欄位名稱} 當動態內容 (可按「插入欄位」選 Excel 的欄位)"));
     tf->addRow(textEdit_);
 
     fieldCombo_ = new QComboBox;
@@ -816,26 +944,14 @@ QWidget* DesignerWindow::buildPreviewPanel() {
     auto* v = new QVBoxLayout(w);
 
     usePreviewCheck_ = new QCheckBox(tr("以此資料預覽"));
-    usePreviewCheck_->setToolTip(tr("取消勾選時，動態欄位 {姓名} 等會直接顯示原樣"));
+    usePreviewCheck_->setToolTip(tr("取消勾選時，動態欄位 {欄位名稱} 等會直接顯示原樣"));
     usePreviewCheck_->setChecked(true);
     v->addWidget(usePreviewCheck_);
 
-    // 尚未載入 Excel 時的範例值；載入後，選取某一筆資料會把該筆資料填進這些欄位
-    const QMap<QString, QString> samples{
-        { QStringLiteral("姓名"), QStringLiteral("王小明") },
-        { QStringLiteral("學號"), QStringLiteral("315130106") },
-        { QStringLiteral("系所"), QStringLiteral("職業安全衛生系") },
-        { QStringLiteral("內碼"), QStringLiteral("1234567890") },
-        { QStringLiteral("外碼"), QStringLiteral("9876543210") } };
-    auto* form = new QFormLayout;
-    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    for (const QString& name : card::fieldNames()) {
-        auto* edit = new QLineEdit(samples.value(name));
-        form->addRow(name + QStringLiteral("："), edit);
-        previewEdits_.emplace_back(name, edit);
-        connect(edit, &QLineEdit::textChanged, this, [this] { applyPreviewRecord(); });
-    }
-    v->addLayout(form);
+    previewForm_ = new QFormLayout;
+    previewForm_->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    v->addLayout(previewForm_);
+    rebuildPreviewForm();                     // 欄位依目前可用的欄位建立 (載入 Excel 後會重建)
     v->addStretch(1);
 
     connect(usePreviewCheck_, &QCheckBox::toggled, this, [this] { applyPreviewRecord(); });
@@ -848,7 +964,7 @@ QWidget* DesignerWindow::buildDataPanel() {
 
     auto* top = new QHBoxLayout;
     auto* loadBtn = new QPushButton(tr("載入 Excel…"));
-    dataInfo_ = new QLabel(tr("尚未載入資料\n需要欄位：%1").arg(card::fieldNames().join(QStringLiteral("、"))));
+    dataInfo_ = new QLabel(tr("尚未載入資料\n載入 Excel 後，所有欄位都可以用在文字與圖片"));
     dataInfo_->setWordWrap(true);
     top->addWidget(loadBtn);
     top->addWidget(dataInfo_, 1);
@@ -856,7 +972,7 @@ QWidget* DesignerWindow::buildDataPanel() {
 
 
     dataFilter_ = new QLineEdit;
-    dataFilter_->setPlaceholderText(tr("搜尋 (姓名、學號、系所…)"));
+    dataFilter_->setPlaceholderText(tr("搜尋 (任一欄位)"));
     dataFilter_->setClearButtonEnabled(true);
     v->addWidget(dataFilter_);
 
@@ -892,6 +1008,7 @@ void DesignerWindow::applyPreviewRecord() {
         imagePool_.applyTo(previewRecord_, layout_);              // 各動態圖片依自己的資料夾與比對欄位帶入圖片
     }
     refitAll();
+    if (layout_.background.path.contains(QLatin1Char('{'))) refreshBackgroundPanel();   // 底圖路徑含 {欄位}：換資料後重新檢查檔案
     if (scene_) scene_->update();
 }
 
@@ -923,6 +1040,7 @@ void DesignerWindow::rebuildScene(bool refit) {
     card::fitAll(layout_, previewRecord_); // 貼合內容的元素依目前預覽資料重新貼合
     scene_->clear();                       // 會刪除舊的卡片與所有元素
     cardItem_ = nullptr;
+    bgItem_ = nullptr;
     guides_ = nullptr;
 
     const double w = layout_.widthMm() * ElementItem::kPxPerMm;
@@ -933,6 +1051,7 @@ void DesignerWindow::rebuildScene(bool refit) {
     guides_ = new GuideOverlay(QRectF(0, 0, w, h), ElementItem::kPxPerMm);   // 輔助線圖層 (最上層)
     scene_->addItem(guides_);
 
+    bgItem_ = new BackgroundItem(&layout_, &previewRecord_, cardItem_);       // 卡面底圖：最底層
     for (int i = 0; i < layout_.elements.size(); ++i) createItem(layout_.elements[i].id, i);
     for (int i = 0; i < layout_.topcoat.regions.size(); ++i) createRegionItem(layout_.topcoat.regions[i].id, 10000 + i);   // 鍍膜範圍疊在最上層
 
@@ -944,6 +1063,7 @@ void DesignerWindow::rebuildScene(bool refit) {
     refreshList();
     populatePanel(nullptr);
     refreshTopcoatPanel();
+    refreshBackgroundPanel();
     updateActionStates();
     if (refit) fitView();
     else if (view_->onViewChanged) view_->onViewChanged();
@@ -1001,7 +1121,10 @@ void DesignerWindow::addElement(card::ElementType type) {
         QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));        // 沿用上次使用的資料夾 / 比對欄位
         e.imageSource = card::ImageSource::Dynamic;
         e.imageFolder = st.value(QStringLiteral("lastImageFolder"), st.value(QStringLiteral("imageFolder"))).toString();
-        e.matchField = st.value(QStringLiteral("lastMatchField"), st.value(QStringLiteral("matchField"), QStringLiteral("姓名"))).toString();
+        QString mf = st.value(QStringLiteral("lastMatchField"), st.value(QStringLiteral("matchField"), QStringLiteral("姓名"))).toString();
+        const QStringList avail = currentFields();
+        if (!avail.contains(mf) && !avail.isEmpty()) mf = avail.first();             // 上次的欄位不在這份資料裡：先用第一個欄位，請使用者再選
+        e.matchField = mf;
         e.imageFit = card::ImageFit::Cover;
     }
     layout_.elements.append(e);
@@ -1103,7 +1226,7 @@ void DesignerWindow::openPrintDialog() {
     if (data_.rows.isEmpty()) {
         // 還沒載入 Excel：用「預覽資料」欄位的內容印 1 張 (方便先用單張測試印表機與版面)
         in.previewOnly = true;
-        in.data.fields = card::fieldNames();
+        in.data.fields = currentFields();
         card::Record rec;
         for (const auto& pr : previewEdits_) rec.insert(pr.first, pr.second->text());
         in.data.rows.append(rec);
@@ -1121,7 +1244,272 @@ void DesignerWindow::openPrintDialog() {
     dlg.exec();
 }
 
+// ================================================================ 卡面底圖 ===
+
+QWidget* DesignerWindow::buildBackgroundPanel() {
+    auto* w = new QWidget;
+    w->setMinimumWidth(uiscale::px(300));
+    backgroundPanel_ = w;
+    auto* root = new QVBoxLayout(w);
+
+    auto* hint = new QLabel(tr("匯入卡面的圖，墊在所有元素的最底層，讓你設計文字與圖片時可以對位。\n"
+        "預設只在設計畫面顯示當參考，不會印出；勾選「列印時印出」後，預覽輸出與批次列印才會把它印在卡面上。"));
+    hint->setWordWrap(true);
+    hint->setStyleSheet(QStringLiteral("color:#666;"));
+    root->addWidget(hint);
+
+    auto* box = new QGroupBox(tr("底圖"));
+    auto* f = new QFormLayout(box);
+
+    bgPathEdit_ = new QLineEdit;
+    bgPathEdit_->setPlaceholderText(tr("卡面圖片檔路徑 (留空 = 沒有底圖)"));
+    bgPathEdit_->setToolTip(tr("路徑也可以含 {欄位}，例如 D:\\faces\\{系所}.png，不同資料就能用不同的卡面。"));
+    auto* browse = new QPushButton(tr("匯入…"));
+    bgClearBtn_ = new QPushButton(tr("移除"));
+    auto* pathRow = new QWidget;
+    auto* pl = new QHBoxLayout(pathRow);
+    pl->setContentsMargins(0, 0, 0, 0);
+    pl->addWidget(bgPathEdit_, 1);
+    pl->addWidget(browse);
+    pl->addWidget(bgClearBtn_);
+    f->addRow(tr("圖片"), pathRow);
+
+    bgInfoLabel_ = new QLabel;
+    bgInfoLabel_->setWordWrap(true);
+    f->addRow(bgInfoLabel_);
+
+    bgFitCombo_ = new QComboBox;
+    bgFitCombo_->addItem(tr("裁切填滿 (蓋滿卡面，超出的裁掉)"));
+    bgFitCombo_->addItem(tr("縮放適應 (整張放進卡面，可能留白)"));
+    bgFitCombo_->addItem(tr("拉伸 (填滿卡面，比例會改變)"));
+    bgFitCombo_->setToolTip(tr("卡面圖的比例與卡面一致 (85.6 × 54 mm) 時三種結果相同；比例不同時才有差別。"));
+    f->addRow(tr("顯示方式"), bgFitCombo_);
+
+    auto makePctSpin = [] {
+        auto* s = new QDoubleSpinBox;
+        s->setRange(0, 100);
+        s->setDecimals(0);
+        s->setSingleStep(5);
+        s->setSuffix(QStringLiteral(" %"));
+        s->setValue(50);
+        return s;
+        };
+    bgFocusXSpin_ = makePctSpin();
+    bgFocusYSpin_ = makePctSpin();
+    f->addRow(tr("水平位置"), bgFocusXSpin_);
+    f->addRow(tr("垂直位置"), bgFocusYSpin_);
+    root->addWidget(box);
+
+    auto* outBox = new QGroupBox(tr("顯示與列印"));
+    auto* ol = new QVBoxLayout(outBox);
+    bgShowCheck_ = new QCheckBox(tr("設計時顯示"));
+    bgShowCheck_->setToolTip(tr("只影響編輯畫面，不影響列印。"));
+    bgPrintCheck_ = new QCheckBox(tr("列印時印出"));
+    bgPrintCheck_->setToolTip(tr("不勾選：底圖只是設計時的參考，輸出預覽圖與列印都不含底圖。\n"
+        "勾選：渲染卡面時先畫底圖，再疊上文字與圖片。"));
+    ol->addWidget(bgShowCheck_);
+    ol->addWidget(bgPrintCheck_);
+    root->addWidget(outBox);
+    root->addStretch(1);
+
+    // ---- 使用者編輯 -> 模型 ----
+    connect(browse, &QPushButton::clicked, this, [this] { importBackground(); });
+    connect(bgClearBtn_, &QPushButton::clicked, this, [this] { clearBackground(); });
+    connect(bgPathEdit_, &QLineEdit::editingFinished, this, [this] {
+        if (updating_) return;
+        const QString v = bgPathEdit_->text().trimmed();
+        if (v == layout_.background.path.trimmed()) return;
+        commitUndo();
+        editBackground([&](card::CardBackground& b) { b.path = v; });
+        commitUndo();
+        refreshBackgroundPanel();
+        });
+    connect(bgFitCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_) return;
+        editBackground([&](card::CardBackground& b) { b.fit = static_cast<card::ImageFit>(i); });
+        refreshBackgroundPanel();
+        });
+    connect(bgFocusXSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!updating_) editBackground([&](card::CardBackground& b) { b.focusX = v; });
+        });
+    connect(bgFocusYSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!updating_) editBackground([&](card::CardBackground& b) { b.focusY = v; });
+        });
+    connect(bgShowCheck_, &QCheckBox::toggled, this, [this](bool on) {
+        if (!updating_) editBackground([&](card::CardBackground& b) { b.showInDesigner = on; });
+        });
+    connect(bgPrintCheck_, &QCheckBox::toggled, this, [this](bool on) {
+        if (updating_) return;
+        editBackground([&](card::CardBackground& b) { b.print = on; });
+        refreshBackgroundPanel();
+        statusBar()->showMessage(on ? tr("卡面底圖：列印時會印出") : tr("卡面底圖：僅設計時參考，不會印出"), 4000);
+        });
+
+    return w;
+}
+
+void DesignerWindow::editBackground(const std::function<void(card::CardBackground&)>& fn) {
+    if (updating_) return;
+    fn(layout_.background);
+    if (bgItem_) bgItem_->update();
+    updateActionStates();
+    scheduleCommit();
+}
+
+void DesignerWindow::importBackground() {
+    const card::CardBackground& cur = layout_.background;
+    const QString start = cur.isEmpty() ? lastDataDir_ : QFileInfo(cur.path).absolutePath();
+    const QString f = QFileDialog::getOpenFileName(this, tr("匯入卡面底圖"), start,
+        tr("圖片 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)"));
+    if (f.isEmpty()) return;
+    commitUndo();
+    card::clearImageCache();                // 同一個檔名被改過內容時，重新讀取
+    layout_.background.path = QDir::toNativeSeparators(f);
+    if (bgItem_) bgItem_->update();
+    refreshBackgroundPanel();
+    updateActionStates();
+    commitUndo();
+    backgroundDock_->show();
+    backgroundDock_->raise();
+    statusBar()->showMessage(tr("已匯入卡面底圖 (預設只在設計時顯示，不會印出；要印出請勾選「列印時印出」)"), 6000);
+}
+
+void DesignerWindow::clearBackground() {
+    if (layout_.background.isEmpty()) return;
+    commitUndo();
+    layout_.background.path.clear();
+    if (bgItem_) bgItem_->update();
+    refreshBackgroundPanel();
+    updateActionStates();
+    commitUndo();
+}
+
+void DesignerWindow::refreshBackgroundPanel() {
+    if (!bgPathEdit_) return;
+    const bool prev = updating_;
+    updating_ = true;
+    const card::CardBackground& b = layout_.background;
+    if (bgPathEdit_->text() != b.path) bgPathEdit_->setText(b.path);
+    bgFitCombo_->setCurrentIndex(qBound(0, int(b.fit), 2));
+    bgFocusXSpin_->setValue(b.focusX);
+    bgFocusYSpin_->setValue(b.focusY);
+    bgShowCheck_->setChecked(b.showInDesigner);
+    bgPrintCheck_->setChecked(b.print);
+
+    const bool has = !b.isEmpty();
+    const bool crop = b.fit == card::ImageFit::Cover || b.fit == card::ImageFit::Contain;
+    bgClearBtn_->setEnabled(has);
+    bgFitCombo_->setEnabled(has);
+    bgFocusXSpin_->setEnabled(has && crop);
+    bgFocusYSpin_->setEnabled(has && crop);
+    bgShowCheck_->setEnabled(has);
+    bgPrintCheck_->setEnabled(has);
+
+    // 狀態說明：圖片大小、比例是否與卡面一致、會不會印出
+    QString info;
+    if (!has) {
+        info = tr("尚未匯入卡面底圖。");
+    }
+    else {
+        const QString real = card::substitute(b.path, previewRecord_);
+        const QSize sz = QImageReader(real).size();
+        if (!QFileInfo::exists(real)) {
+            info = tr("<span style='color:#c62828;'>找不到圖片檔：%1</span>").arg(real.toHtmlEscaped());
+        }
+        else if (!sz.isValid()) {
+            info = tr("<span style='color:#c62828;'>無法讀取這個圖片檔。</span>");
+        }
+        else {
+            const double imgRatio = double(sz.width()) / sz.height();
+            const double cardRatio = layout_.widthMm() / layout_.heightMm();
+            info = tr("圖片 %1 × %2 px (比例 %3)；卡面比例 %4").arg(sz.width()).arg(sz.height())
+                .arg(imgRatio, 0, 'f', 3).arg(cardRatio, 0, 'f', 3);
+            if (qAbs(imgRatio / cardRatio - 1.0) > 0.02)
+                info += tr("<br><span style='color:#e65100;'>圖片比例與卡面不同，請確認「顯示方式」。</span>");
+        }
+        info += b.print ? tr("<br><span style='color:#1f7a3d;'>列印時<b>會印出</b>。</span>")
+            : tr("<br><span style='color:#666;'>僅設計時參考，<b>不會印出</b>。</span>");
+    }
+    bgInfoLabel_->setTextFormat(Qt::RichText);
+    bgInfoLabel_->setText(info);
+    if (actClearBg_) actClearBg_->setEnabled(has);
+    updating_ = prev;
+}
+
 // ========================================================= 製卡資料 (階段 2) ===
+
+// ----------------------------------------------------------- 欄位 (依 Excel 而定) ---
+
+QStringList DesignerWindow::currentFields() const {
+    return data_.fields.isEmpty() ? card::fieldNames() : data_.fields;
+}
+
+QStringList DesignerWindow::layoutFields() const {
+    static const QRegularExpression re(QStringLiteral("\\{([^{}]+)\\}"));
+    QStringList out;
+    auto add = [&out](const QString& f) { if (!f.isEmpty() && !out.contains(f)) out << f; };
+    auto addFrom = [&](const QString& src) {
+        auto it = re.globalMatch(src);
+        while (it.hasNext()) add(it.next().captured(1));
+        };
+    addFrom(layout_.background.path);      // 卡面底圖的路徑也可以含 {欄位}
+    for (const auto& e : layout_.elements) {
+        if (e.type == card::ElementType::Text) addFrom(e.text);
+        else if (e.type == card::ElementType::Image) {
+            if (e.imageSource == card::ImageSource::Dynamic) add(e.matchField.trimmed());
+            else addFrom(e.imagePath);
+        }
+    }
+    return out;
+}
+
+void DesignerWindow::rebuildPreviewForm() {
+    if (!previewForm_) return;
+    previewEdits_.clear();
+    while (previewForm_->rowCount() > 0) previewForm_->removeRow(0);
+
+    // 尚未載入 Excel 時的範例值；載入後，選取某一筆資料會把該筆資料填進這些欄位
+    static const QMap<QString, QString> samples{
+        { QStringLiteral("姓名"), QStringLiteral("王小明") },
+        { QStringLiteral("學號"), QStringLiteral("315130106") },
+        { QStringLiteral("系所"), QStringLiteral("職業安全衛生系") },
+        { QStringLiteral("內碼"), QStringLiteral("1234567890") },
+        { QStringLiteral("外碼"), QStringLiteral("9876543210") } };
+    const bool noData = data_.fields.isEmpty();
+    for (const QString& name : currentFields()) {
+        auto* edit = new QLineEdit(noData ? samples.value(name) : QString());
+        previewForm_->addRow(name + QStringLiteral("："), edit);
+        previewEdits_.emplace_back(name, edit);
+        connect(edit, &QLineEdit::textChanged, this, [this] { applyPreviewRecord(); });
+    }
+}
+
+void DesignerWindow::rebuildFieldWidgets() {
+    const QStringList fields = currentFields();
+
+    if (fieldCombo_) {                                           // 文字：插入欄位
+        const QString keep = fieldCombo_->currentText();
+        QSignalBlocker b(fieldCombo_);
+        fieldCombo_->clear();
+        fieldCombo_->addItems(fields);
+        fieldCombo_->setCurrentIndex(qMax(0, fieldCombo_->findText(keep)));
+    }
+    if (matchFieldCombo_) {                                      // 圖片：比對欄位
+        QSignalBlocker b(matchFieldCombo_);
+        matchFieldCombo_->clear();
+        matchFieldCombo_->addItems(fields);
+        ElementItem* it = selectedItem();
+        const card::Element* e = it ? layout_.find(it->id()) : nullptr;
+        matchFieldCombo_->setCurrentIndex(e ? matchFieldCombo_->findText(e->matchField) : -1);   // 找不到 (-1) = 空白，請使用者選
+    }
+    rebuildPreviewForm();                                        // 右側預覽資料
+
+    // 左邊資料表：Excel 的所有欄位 + 最後一欄「圖片」
+    dataTable_->setColumnCount(int(fields.size()) + 1);
+    dataTable_->setHorizontalHeaderLabels(QStringList(fields) << tr("圖片"));
+    if (auto* h = dataTable_->horizontalHeaderItem(int(fields.size())))
+        h->setToolTip(tr("目前選取的「動態圖片」元素的比對結果 (沒有選取時顯示版面中第一個動態圖片)。\n圖片的資料夾與比對欄位在右邊「屬性」面板設定，每個圖片各自設定。"));
+}
 
 void DesignerWindow::browseData() {
     const QString path = QFileDialog::getOpenFileName(this, tr("載入製卡資料"), lastDataDir_,
@@ -1131,10 +1519,29 @@ void DesignerWindow::browseData() {
 }
 
 bool DesignerWindow::loadData(const QString& path) {
-    card::DataTable t;
+    // 1) 先把整張工作表讀出來 (只讀一次)
+    QList<QStringList> raw;
     QString err;
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const bool ok = card::loadExcelTable(path, card::fieldNames(), &t, &err);
+    const bool readOk = card::readXlsxFirstSheet(path, &raw, &err);
+    QApplication::restoreOverrideCursor();
+    if (!readOk) {
+        QMessageBox::warning(this, tr("載入失敗"), err);
+        return false;
+    }
+    if (raw.isEmpty()) {
+        QMessageBox::warning(this, tr("載入失敗"), tr("工作表是空的"));
+        return false;
+    }
+
+    // 2) 確認標題列 (欄位名稱所在的那一列)
+    HeaderRowDialog dlg(path, raw, this);
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    // 3) 匯入所有欄位
+    card::DataTable t;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool ok = card::buildDataTableAll(raw, dlg.headerRow(), path, &t, &err);
     QApplication::restoreOverrideCursor();
     if (!ok) {
         QMessageBox::warning(this, tr("載入失敗"), err);
@@ -1147,6 +1554,8 @@ bool DesignerWindow::loadData(const QString& path) {
     dataTable_->blockSignals(true);
     dataFilter_->blockSignals(true);
     dataFilter_->clear();
+    rebuildFieldWidgets();                         // 依 Excel 的欄位，重建「插入欄位」、圖片比對欄位、預覽資料、資料表欄
+    const QStringList usedFields = layoutFields();
     dataTable_->setUpdatesEnabled(false);
     dataTable_->clearContents();
     dataTable_->setRowCount(int(data_.rows.size()));
@@ -1154,7 +1563,7 @@ bool DesignerWindow::loadData(const QString& path) {
         for (int c = 0; c < data_.fields.size(); ++c) {
             const QString v = data_.rows[r].value(data_.fields[c]);
             auto* item = new QTableWidgetItem(v);
-            if (v.isEmpty()) {                       // 缺資料 (含 Excel 的 #N/A 等錯誤值) 以淡紅色標示
+            if (v.isEmpty() && usedFields.contains(data_.fields[c])) {   // 版面用到的欄位缺資料 (含 Excel 的 #N/A 等錯誤值) 以淡紅色標示
                 item->setBackground(QColor(255, 215, 215));
                 item->setToolTip(tr("此欄位沒有資料 (空白或 Excel 錯誤值如 #N/A)"));
             }
@@ -1173,6 +1582,17 @@ bool DesignerWindow::loadData(const QString& path) {
     updateRecordLabel();
     dataDock_->show();
     dataDock_->raise();
+
+    // 版面 (文字的 {欄位}、圖片的比對欄位) 用到、但這份 Excel 沒有的欄位 -> 提醒使用者改選
+    QStringList missing;
+    for (const QString& f : layoutFields())
+        if (!data_.fields.contains(f)) missing << QStringLiteral("「%1」").arg(f);
+    if (!missing.isEmpty()) {
+        QMessageBox::information(this, tr("版面用到的欄位不在這份 Excel"),
+            tr("目前版面用到、但這份 Excel 沒有的欄位：\n%1\n\n這些內容會維持原樣顯示。\n"
+                "請把文字內的 {欄位} 改成 Excel 有的欄位 (可用「插入欄位」)，或重新選擇圖片的「比對欄位」。")
+            .arg(missing.join(QStringLiteral("、"))));
+    }
 
     if (data_.rows.isEmpty()) {
         QMessageBox::information(this, tr("沒有資料"), tr("已讀取欄位，但標題列下面沒有任何資料列。"));
@@ -1336,10 +1756,20 @@ void DesignerWindow::applyDataRow(int row) {
     const card::Record& rec = data_.rows[row];
 
     usePreviewCheck_->setChecked(true);
-    for (const auto& pr : previewEdits_) pr.second->setText(rec.value(pr.first));   // 每次變動都會自動重畫
+    for (const auto& pr : previewEdits_) {                                           // 欄位很多時，不要每個欄位都重畫一次
+        QSignalBlocker b(pr.second);
+        pr.second->setText(rec.value(pr.first));
+    }
+    applyPreviewRecord();
     updateRecordLabel();
+
+    QString label;                                                                   // 狀態列辨識用：版面有用到、且有值的第一個欄位
+    const QStringList used = layoutFields();
+    for (const QString& f : data_.fields)
+        if (used.contains(f) && !rec.value(f).isEmpty()) { label = rec.value(f); break; }
+    if (label.isEmpty()) label = rec.value(data_.fields.value(0));
     statusBar()->showMessage(tr("預覽第 %1 / %2 筆：%3")
-        .arg(row + 1).arg(data_.rows.size()).arg(rec.value(QStringLiteral("姓名"))), 8000);
+        .arg(row + 1).arg(data_.rows.size()).arg(label), 8000);
 }
 
 void DesignerWindow::stepRecord(int delta) {
@@ -1376,10 +1806,12 @@ void DesignerWindow::updateDataInfo() {
     if (visible != data_.rows.size()) s += tr("，符合 %1 筆").arg(visible);
     if (data_.skippedBlankRows > 0) s += tr("（略過 %1 列空白）").arg(data_.skippedBlankRows);
     int incomplete = 0;
+    const QStringList used = layoutFields();                                  // 只檢查版面真的用到的欄位
     for (const auto& rec : data_.rows) {
-        for (const QString& f : data_.fields) if (rec.value(f).isEmpty()) { ++incomplete; break; }
+        for (const QString& f : used)
+            if (data_.fields.contains(f) && rec.value(f).isEmpty()) { ++incomplete; break; }
     }
-    if (incomplete > 0) s += tr("\n⚠ %1 筆有欄位缺資料 (標紅)").arg(incomplete);
+    if (incomplete > 0) s += tr("\n⚠ %1 筆有版面用到的欄位缺資料 (標紅)").arg(incomplete);
     dataInfo_->setText(s);
 }
 
@@ -1696,6 +2128,7 @@ void DesignerWindow::applyUiScale() {
     if (recordLabel_) recordLabel_->setMinimumWidth(px(110));
     if (propertyPanel_) propertyPanel_->setMinimumWidth(px(300));
     if (topcoatPanel_) topcoatPanel_->setMinimumWidth(px(300));
+    if (backgroundPanel_) backgroundPanel_->setMinimumWidth(px(300));
     if (textEdit_) textEdit_->setFixedHeight(px(64));
     if (regionList_) regionList_->setMinimumHeight(px(90));
     if (colorBtn_) {

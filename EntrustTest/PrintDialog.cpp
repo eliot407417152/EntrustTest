@@ -75,6 +75,19 @@ namespace {
         return re;
     }
 
+    // 進度表 / Log 用來辨識一筆資料的文字，例如「王小明 (315130106)」
+    QString titleOf(const QStringList& labelFields, const card::Record& rec) {
+        QStringList parts;
+        for (const QString& f : labelFields) {
+            const QString v = rec.value(f).trimmed();
+            if (!v.isEmpty()) parts << v;
+        }
+        if (parts.isEmpty()) return QString();
+        QString s = parts.first();
+        if (parts.size() > 1) s += QStringLiteral(" (%1)").arg(parts.at(1));
+        return s;
+    }
+
 } // namespace
 
 // ================================================================ construction ===
@@ -98,6 +111,15 @@ PrintDialog::PrintDialog(const PrintInput& in, QWidget* parent) : QDialog(parent
         auto it = placeholderRe().globalMatch(src);
         while (it.hasNext()) usedFields_.insert(it.next().captured(1));
     }
+    if (in_.layout.background.print) {                         // 要印出的卡面底圖，路徑可含 {欄位}
+        auto it = placeholderRe().globalMatch(in_.layout.background.path);
+        while (it.hasNext()) usedFields_.insert(it.next().captured(1));
+    }
+    // 辨識每一筆資料用的欄位：優先用版面有用到的欄位 (照 Excel 欄位順序)，最多 2 個；不夠再用前面的欄位補
+    for (const QString& f : in_.data.fields)
+        if (labelFields_.size() < 2 && usedFields_.contains(f)) labelFields_ << f;
+    for (const QString& f : in_.data.fields)
+        if (labelFields_.size() < 2 && !labelFields_.contains(f)) labelFields_ << f;
     buildUi();
     loadSettings();
     updateModeUi();
@@ -252,7 +274,7 @@ void PrintDialog::buildUi() {
     // ------------------------------------------------ 逐筆進度表 + Log
     auto* split = new QSplitter(Qt::Vertical);
     table_ = new QTableWidget(0, 5);
-    table_->setHorizontalHeaderLabels({ tr("序號"), tr("姓名"), tr("學號"), tr("狀態"), tr("訊息") });
+    table_->setHorizontalHeaderLabels({ tr("序號"), labelFields_.value(0, tr("資料")), labelFields_.value(1), tr("狀態"), tr("訊息") });
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->verticalHeader()->setVisible(false);
@@ -451,6 +473,12 @@ QStringList PrintDialog::problemsOf(int row) const {
         else if (rec.value(f).trimmed().isEmpty()) p << tr("「%1」無資料").arg(f);
     }
 
+    if (in_.layout.background.print) {                                // 卡面底圖要印出，檔案不在就是問題 (不然會印出一張沒有底圖的卡)
+        const QString bgPath = card::substitute(in_.layout.background.path, rec);
+        if (in_.layout.background.isEmpty()) p << tr("卡面底圖已設定為印出，但未指定圖片檔");
+        else if (!QFileInfo::exists(bgPath)) p << tr("找不到卡面底圖：%1").arg(bgPath);
+    }
+
     for (const auto& e : in_.layout.elements) {                       // 圖片：每個圖片元素各自檢查
         if (e.type != card::ElementType::Image) continue;
         const QString who = tr("圖片「%1」").arg(e.name);
@@ -550,8 +578,8 @@ void PrintDialog::updateRow(int i) {
     }
     if (it.state == State::Pending && !it.message.isEmpty()) bg = QColor(255, 243, 190);
 
-    const QStringList cells{ QString::number(it.row + 1), rec.value(QStringLiteral("姓名")),
-                             rec.value(QStringLiteral("學號")), stateText, it.message };
+    const QStringList cells{ QString::number(it.row + 1), rec.value(labelFields_.value(0)),
+                             rec.value(labelFields_.value(1)), stateText, it.message };
     for (int c = 0; c < cells.size(); ++c) {
         QTableWidgetItem* x = table_->item(i, c);
         if (!x) { x = new QTableWidgetItem; table_->setItem(i, c, x); }
@@ -717,7 +745,7 @@ QString PrintDialog::renderItem(int itemIndex, int dpi, bool dryRun, const QStri
     if (dryRun) {
         path = QDir(outDir).filePath(QStringLiteral("%1_%2.png")
             .arg(it.row + 1, 4, 10, QLatin1Char('0'))
-            .arg(sanitizeFileName(rec.value(QStringLiteral("姓名")))));
+            .arg(sanitizeFileName(rec.value(labelFields_.value(0)))));
     }
     else {
         // 印表機進卡為橫向：直式卡面要旋轉後才送出 (測試模式輸出的是卡面原樣，不旋轉)
@@ -741,10 +769,10 @@ void PrintDialog::markPrinting(int itemIndex, int seq, int total) {
     updateRow(itemIndex);
     table_->scrollToItem(table_->item(itemIndex, 3));
     const card::Record& rec = in_.data.rows[items_[itemIndex].row];
-    currentLabel_->setText(tr("第 %1 / %2 張：%3 (%4)")
-        .arg(seq).arg(total).arg(rec.value(QStringLiteral("姓名")), rec.value(QStringLiteral("學號"))));
+    currentLabel_->setText(tr("第 %1 / %2 張：%3")
+        .arg(seq).arg(total).arg(titleOf(labelFields_, rec)));
     log(tr("[%1/%2] 開始：%3 (資料第 %4 筆)").arg(seq).arg(total)
-        .arg(rec.value(QStringLiteral("姓名"))).arg(items_[itemIndex].row + 1));
+        .arg(titleOf(labelFields_, rec)).arg(items_[itemIndex].row + 1));
 }
 
 void PrintDialog::setItemResult(int itemIndex, bool ok, const QString& message, double seconds) {
@@ -839,7 +867,7 @@ void PrintDialog::log(const QString& line) {
 
 void PrintDialog::logItem(int itemIndex, const QString& line) {
     const card::Record& rec = in_.data.rows[items_[itemIndex].row];
-    log(QStringLiteral("  #%1 %2 | %3").arg(items_[itemIndex].row + 1).arg(rec.value(QStringLiteral("姓名")), line));
+    log(QStringLiteral("  #%1 %2 | %3").arg(items_[itemIndex].row + 1).arg(titleOf(labelFields_, rec), line));
 }
 
 // 版面的鍍膜設定 → 印表機座標。直式卡面會先旋轉 90° 才送出，範圍必須用「同一個方向」換算。
@@ -875,6 +903,8 @@ QString PrintDialog::settingsSummary() const {
     if (!dryCheck_->isChecked())
         l << tr("鍍膜：%1").arg(topcoatForPrinter().isDefault() ? tr("不送出 (沿用驅動程式設定)")
             : QString::fromStdWString(topcoat::describe(topcoatForPrinter())));
+    if (!in_.layout.background.isEmpty())
+        l << tr("卡面底圖：%1 (%2)").arg(in_.layout.background.path, in_.layout.background.print ? tr("印出") : tr("不印出"));
     for (const auto& e : in_.layout.elements) {
         if (e.type != card::ElementType::Image) continue;
         if (e.imageSource == card::ImageSource::Fixed)

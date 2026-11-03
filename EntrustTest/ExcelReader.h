@@ -24,4 +24,24 @@ namespace card {
     bool loadExcelTable(const QString& path, const QStringList& requiredFields,
         DataTable* out, QString* error = nullptr);
 
+    // ---- 載入「所有欄位」：標題列下的每一欄都匯入，文字與圖片可任選其中的欄位當參考 ----
+
+    // Excel 欄號：0 -> "A"、27 -> "AB"
+    QString excelColumnName(int index);
+
+    // 自動猜標題列：前 30 列中，第一個「非空白儲存格數達最大值 7 成以上」的列
+    // (標題列有幾格空白時，不會被下面資料較滿的列搶走；上方只有標題文字的說明列也不會被選到)。0 起算；空表回傳 -1。
+    int detectHeaderRow(const QList<QStringList>& raw);
+
+    // 以 headerRow 為標題列，回傳要匯入的所有欄位名稱。
+    //  - 標題空白、但底下有資料的欄位，命名為「欄C」(C = Excel 欄號)；整欄空白的略過
+    //  - 標題重複時，後面的加上 (2)、(3)
+    //  - 標題裡的 { } 換成 ( )，避免和 {欄位} 的語法衝突
+    // columnIndexes (可省略) 會填入各欄位對應的 Excel 欄索引 (0 起算)。
+    QStringList importFields(const QList<QStringList>& raw, int headerRow, QList<int>* columnIndexes = nullptr);
+
+    // 以 headerRow 為標題列，匯入所有欄位建立資料表。
+    bool buildDataTableAll(const QList<QStringList>& raw, int headerRow, const QString& path,
+        DataTable* out, QString* error = nullptr);
+
 } // namespace card

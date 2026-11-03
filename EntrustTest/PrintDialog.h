@@ -95,6 +95,7 @@ private:
 
     PrintInput in_;
     QSet<QString> usedFields_;                 // 版面中 {欄位} 用到的欄位
+    QStringList labelFields_;                  // 進度表 / Log 用來辨識每一筆資料的欄位 (最多 2 個，依資料欄位而定)
     bool hasAutoImage_ = false;                // 有「動態圖片」元素 (依資料帶入)
     QHash<QString, QHash<QString, int>> matchValueCount_;   // 動態圖片元素 id -> (比對欄位的值 -> 在整份資料出現幾次，偵測資料重名)
 

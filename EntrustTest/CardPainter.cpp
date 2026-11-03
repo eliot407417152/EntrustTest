@@ -117,6 +117,20 @@ namespace card {
         p.restore();
     }
 
+    void paintBackground(QPainter& p, const CardBackground& bg, const QRectF& r, double pxPerMm, const Record& rec) {
+        if (bg.isEmpty()) return;
+        // 借用圖片元素的繪製邏輯 (含快取、顯示方式、位置)：把底圖當成「鋪滿整張卡的固定圖片」
+        Element e;
+        e.type = ElementType::Image;
+        e.imageSource = ImageSource::Fixed;
+        e.imagePath = bg.path;
+        e.imageFit = bg.fit == ImageFit::MatchHeight ? ImageFit::Cover : bg.fit;
+        e.imageFocusX = bg.focusX;
+        e.imageFocusY = bg.focusY;
+        if (!QFileInfo::exists(substitute(bg.path, rec))) return;   // 找不到檔案就不畫 (不要在卡面上畫出「找不到圖片」的提示框)
+        paintElement(p, e, r, pxPerMm, rec);
+    }
+
     bool fitElement(Element& e, const Record& rec) {
         double nw = e.wMm, nh = e.hMm;
 
@@ -174,6 +188,8 @@ namespace card {
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setRenderHint(QPainter::TextAntialiasing, true);
         p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        if (layout.background.print)                                  // 卡面底圖：只有勾選「列印時印出」才會畫進輸出
+            paintBackground(p, layout.background, QRectF(0, 0, w, h), ppm, rec);
         for (const auto& e : layout.elements) {
             paintElement(p, e, QRectF(e.xMm * ppm, e.yMm * ppm, e.wMm * ppm, e.hMm * ppm), ppm, rec);
         }

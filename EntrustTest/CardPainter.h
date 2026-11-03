@@ -12,6 +12,10 @@ namespace card {
 	// 在 painter 上、rectPx 這個矩形內畫出一個元素。pxPerMm 用來換算字型大小。
 	void paintElement(QPainter& p, const Element& e, const QRectF& rectPx, double pxPerMm, const Record& rec);
 
+	// 畫卡面底圖 (鋪滿 rectPx)。不看 print 旗標，由呼叫端決定要不要畫：
+	//   設計畫面：showInDesigner 時畫；renderCard (預覽輸出 / 列印)：print 為 true 時才畫。
+	void paintBackground(QPainter& p, const CardBackground& bg, const QRectF& rectPx, double pxPerMm, const Record& rec);
+
 	// 把整張卡渲染成影像 (dpi 例如 300 / 600)。階段 3 列印時會用它。
 	QImage renderCard(const CardLayout& layout, const Record& rec, int dpi);
 
