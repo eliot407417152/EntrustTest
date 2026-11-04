@@ -146,12 +146,19 @@
     <ClInclude Include="PrintDialog.h" />
     <ClInclude Include="QrCodeGen.h" />
     <ClInclude Include="RegionItem.h" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="SnapGuides.h" />
     <ClInclude Include="Stdafx.h" />
     <ClInclude Include="TopcoatSpec.h" />
     <ClInclude Include="UiScale.h" />
     <ClInclude Include="util.h" />
     <QtMoc Include="MainWindow.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Resource.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="..\..\..\..\Pictures\icon\lai.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Condition="Exists('$(QtMsBuild)\qt.targets')">

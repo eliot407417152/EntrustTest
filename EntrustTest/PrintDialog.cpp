@@ -26,12 +26,14 @@
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QScreen>
+#include <QScrollArea>
 #include <QSettings>
 #include "UiScale.h"
 #include <QSpinBox>
 #include <QSplitter>
 #include <QTableWidget>
 #include <QThread>
+#include <QTimer>
 #include <QTime>
 #include <QTransform>
 #include <QVBoxLayout>
@@ -156,7 +158,17 @@ PrintDialog::PrintDialog(const PrintInput& in, QWidget* parent) : QDialog(parent
 }
 
 void PrintDialog::buildUi() {
-    auto* root = new QVBoxLayout(this);
+    // 外層：上方是「可捲動的內容區」，下方的功能按鈕固定在視窗底部。
+    // 這樣即使螢幕解析度很低、視窗已縮到螢幕大小，內容也只是出現捲軸，按鈕列永遠看得到、按得到。
+    auto* outer = new QVBoxLayout(this);
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto* content = new QWidget;
+    scroll->setWidget(content);
+    outer->addWidget(scroll, 1);
+    auto* root = new QVBoxLayout(content);
+    root->setContentsMargins(0, 0, 0, 0);
 
     // ------------------------------------------------ 上半：印表機 + 範圍 (左右並排)
     auto* top = new QHBoxLayout;
@@ -444,7 +456,7 @@ void PrintDialog::buildUi() {
     btns->addWidget(exportLogBtn_);
     btns->addWidget(exportCsvBtn_);
     btns->addWidget(closeBtn_);
-    root->addLayout(btns);
+    outer->addLayout(btns);          // 按鈕列放在捲動區外面
     cancelBtn_->setEnabled(false);
     retryBtn_->setEnabled(false);
 
@@ -489,6 +501,7 @@ void PrintDialog::buildUi() {
             const int h = qMin(qMax(height(), uiscale::px(900)), maxH);
             resize(w, h);
             uiscale::clampToScreen(this);       // 放大後若跑出螢幕，移回螢幕內
+            QTimer::singleShot(0, this, [this] { uiscale::clampToScreen(this); });   // layout 重算完再檢查一次
         }
         else if (property("preCustomSize").isValid()) {
             resize(property("preCustomSize").toSize());
