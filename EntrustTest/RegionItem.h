@@ -20,6 +20,10 @@ public:
     void syncFromModel();
     void setGuideSink(card::GuideSink fn) { guideSink_ = std::move(fn); }
 
+    // 編輯畫面的檢視選項 (全部鍍膜範圍共用，不影響列印)
+    static bool& outlineOnly();   // true = 只畫虛線外框與標籤，不填色，不會遮住下面的設計
+    static bool& locked();        // true (預設) = 鍍膜範圍完全不接受滑鼠，點擊直接穿透到下面的元素；false = 「編輯鍍膜範圍」模式
+
     static QString kindText(card::RegionKind k);
     static QColor kindColor(card::RegionKind k);
 

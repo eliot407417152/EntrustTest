@@ -31,7 +31,7 @@ namespace {
 }
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle(tr("Datacard 證卡列印"));
+    setWindowTitle(QStringLiteral("Entrust Card Tool"));
 
     auto* central = new QWidget;
     auto* root = new QVBoxLayout(central);

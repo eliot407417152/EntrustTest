@@ -171,12 +171,14 @@ namespace card {
             switch (b) {
             case TopcoatBase::All: return QStringLiteral("all");
             case TopcoatBase::Except: return QStringLiteral("except");
+            case TopcoatBase::None: return QStringLiteral("none");
             default: return QStringLiteral("driver");
             }
         }
         TopcoatBase strToBase(const QString& s) {
             if (s == QLatin1String("all")) return TopcoatBase::All;
             if (s == QLatin1String("except")) return TopcoatBase::Except;
+            if (s == QLatin1String("none")) return TopcoatBase::None;
             return TopcoatBase::DriverDefault;
         }
         QString excToStr(TopcoatException x) {
@@ -359,6 +361,7 @@ namespace card {
         switch (t.base) {
         case TopcoatBase::All: s.base = ::TopcoatSpec::Base::All; break;
         case TopcoatBase::Except: s.base = ::TopcoatSpec::Base::Except; break;
+        case TopcoatBase::None: s.base = ::TopcoatSpec::Base::None; break;
         default: s.base = ::TopcoatSpec::Base::DriverDefault; break;
         }
         switch (t.exception) {

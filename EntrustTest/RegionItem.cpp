@@ -18,6 +18,9 @@ RegionItem::RegionItem(card::CardLayout* layout, const QString& id, ChangedFn on
     syncFromModel();
 }
 
+bool& RegionItem::outlineOnly() { static bool v = false; return v; }
+bool& RegionItem::locked() { static bool v = true; return v; }
+
 QString RegionItem::kindText(RegionKind k) {
     switch (k) {
     case RegionKind::Add: return QStringLiteral("鍍膜區");
@@ -61,8 +64,12 @@ card::SnapContext RegionItem::snapContext() const {
 
 QRectF RegionItem::boundingRect() const { return contentRect().adjusted(-2, -2, 2, 2); }
 
+// 平常 (不在「編輯鍍膜範圍」模式) 完全不接受滑鼠，點擊會穿透到下面的卡面元素，所以不會擋到設計。
+// 進入「編輯鍍膜範圍」模式後 (勾選面板上的核取方塊、新增範圍、或從清單選取範圍)，才可以拖曳 / 縮放範圍；
+// 此時元素暫時不接受滑鼠。
 QPainterPath RegionItem::shape() const {
     QPainterPath p;
+    if (locked()) return p;
     p.addRect(contentRect());
     return p;
 }
@@ -75,8 +82,9 @@ void RegionItem::paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) {
 
     p->save();
     QColor fill = c;
-    fill.setAlpha(reg->kind == RegionKind::Add ? 55 : 80);
-    p->setBrush(fill);
+    fill.setAlpha(reg->kind == RegionKind::Add ? 30 : 45);      // 淡一點，比較不會遮住設計
+    // 平常只畫外框 (不填色，完全不遮住設計)；編輯模式才填淡淡的顏色 (可再用「只畫外框」關掉)
+    p->setBrush((locked() || outlineOnly()) ? QBrush(Qt::NoBrush) : QBrush(fill));
     QPen pen(c, 1.5, Qt::DashLine);
     pen.setCosmetic(true);
     p->setPen(pen);
@@ -84,7 +92,7 @@ void RegionItem::paint(QPainter* p, const QStyleOptionGraphicsItem*, QWidget*) {
 
     p->setClipRect(r);
     QFont f;
-    f.setPixelSize(26);
+    f.setPixelSize(20);
     f.setBold(true);
     p->setFont(f);
     p->setPen(c.darker(130));
@@ -131,6 +139,7 @@ QVariant RegionItem::itemChange(GraphicsItemChange change, const QVariant& value
 }
 
 void RegionItem::mousePressEvent(QGraphicsSceneMouseEvent* ev) {
+    if (locked()) { ev->ignore(); return; }
     if (isSelected()) {
         const card::Handle h = card::hitHandle(ev->pos(), contentRect(), handleSize());
         if (h != card::Handle::None) {
@@ -172,6 +181,6 @@ void RegionItem::mouseReleaseEvent(QGraphicsSceneMouseEvent* ev) {
 
 void RegionItem::hoverMoveEvent(QGraphicsSceneHoverEvent* ev) {
     const card::Handle h = isSelected() ? card::hitHandle(ev->pos(), contentRect(), handleSize()) : card::Handle::None;
-    setCursor(QCursor(card::handleCursor(h)));
+    setCursor(QCursor(h == card::Handle::None ? Qt::SizeAllCursor : card::handleCursor(h)));   // 外框上 = 可拖曳移動
     QGraphicsItem::hoverMoveEvent(ev);
 }

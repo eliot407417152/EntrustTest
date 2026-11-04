@@ -95,7 +95,7 @@ namespace card {
 
     // ---------------------------------------------------------------- 鍍膜 (階段 4) ---
     // 基本設定走 PrintTicket；額外的「範圍」走 Escape (~TA / ~TR / ~PB)。詳見 TopcoatSpec.h。
-    enum class TopcoatBase { DriverDefault = 0, All = 1, Except = 2 };
+    enum class TopcoatBase { DriverDefault = 0, All = 1, Except = 2, None = 3 };   // None = 完全不鍍膜 (順序要與設計畫面的下拉選單一致)
     enum class TopcoatException { Chip7816 = 0, MagJis = 1, MagIso2 = 2, MagIso3 = 3 };
     enum class RegionKind {
         Add = 0,       // 鍍膜區 (~TA)：整面先關閉鍍膜，只在範圍內鍍膜

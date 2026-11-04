@@ -11,10 +11,12 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGuiApplication>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QImage>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -23,6 +25,7 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
+#include <QScreen>
 #include <QSettings>
 #include "UiScale.h"
 #include <QSpinBox>
@@ -32,6 +35,7 @@
 #include <QTime>
 #include <QTransform>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <exception>
 
 namespace {
@@ -92,6 +96,16 @@ namespace {
 
 // ================================================================ construction ===
 
+// 取得表格目前選取的列所對應的 data.rows 索引 (依表格顯示順序)
+static QList<int> rowsOfSelection(QTableWidget* t) {
+    QList<int> tr_;
+    for (const QModelIndex& m : t->selectionModel()->selectedRows()) tr_ << m.row();
+    std::sort(tr_.begin(), tr_.end());
+    QList<int> out;
+    for (int r : tr_) if (auto* it = t->item(r, 0)) out << it->data(Qt::UserRole).toInt();
+    return out;
+}
+
 PrintDialog::PrintDialog(const PrintInput& in, QWidget* parent) : QDialog(parent), in_(in) {
     setWindowTitle(tr("批次列印"));
     uiscale::fitSize(this, 980, 820);       // 依介面大小與螢幕可用範圍決定，不會超出螢幕
@@ -122,6 +136,19 @@ PrintDialog::PrintDialog(const PrintInput& in, QWidget* parent) : QDialog(parent
         if (labelFields_.size() < 2 && usedFields_.contains(f)) labelFields_ << f;
     for (const QString& f : in_.data.fields)
         if (labelFields_.size() < 2 && !labelFields_.contains(f)) labelFields_ << f;
+    {   // 使用者上次在「進度表顯示欄位」選的欄位 (欄位仍存在才採用)；沒有紀錄就用上面自動挑選的結果
+        QSettings s = appSettings();
+        s.beginGroup(QStringLiteral("print"));
+        if (s.contains(QStringLiteral("labelField1"))) {
+            const QString f1 = s.value(QStringLiteral("labelField1")).toString();
+            const QString f2 = s.value(QStringLiteral("labelField2")).toString();
+            if (in_.data.fields.contains(f1)) {
+                labelFields_.clear();
+                labelFields_ << f1;
+                if (!f2.isEmpty() && in_.data.fields.contains(f2)) labelFields_ << f2;
+            }
+        }
+    }
     buildUi();
     loadSettings();
     updateModeUi();
@@ -218,10 +245,12 @@ void PrintDialog::buildUi() {
         : tr("目前選取的這一筆"));
     radioVisible_ = new QRadioButton(tr("資料表目前顯示的全部 (含搜尋過濾結果)"));
     radioRange_ = new QRadioButton(tr("指定範圍："));
+    radioCustom_ = new QRadioButton(tr("自訂清單 (依欄位搜尋後加入，可不連續)"));
     auto* group = new QButtonGroup(this);
     group->addButton(radioCurrent_);
     group->addButton(radioVisible_);
     group->addButton(radioRange_);
+    group->addButton(radioCustom_);
     const int n = int(in_.data.rows.size());
     fromSpin_ = new QSpinBox;
     toSpin_ = new QSpinBox;
@@ -238,6 +267,90 @@ void PrintDialog::buildUi() {
     rrl->addWidget(toSpin_);
     rrl->addWidget(new QLabel(tr("筆 (共 %1 筆)").arg(n)));
     rrl->addStretch(1);
+    // ---- 自訂清單面板 (放在視窗整個寬度)：選欄位 + 關鍵字搜尋 → 把要印的資料加入清單 ----
+    customPanel_ = new QWidget;
+    auto* cpl = new QVBoxLayout(customPanel_);
+    cpl->setContentsMargins(0, 0, 0, 0);
+    fieldCombo_ = new QComboBox;
+    fieldCombo_->addItem(tr("全部欄位"), QString());
+    for (const QString& f : in_.data.fields) fieldCombo_->addItem(f, f);
+    fieldCombo_->setMinimumWidth(160);
+    keywordEdit_ = new QLineEdit;
+    keywordEdit_->setPlaceholderText(tr("關鍵字 (留空 = 全部；多個關鍵字用逗號分隔，符合任一個即可)"));
+    keywordEdit_->setClearButtonEnabled(true);
+    keywordEdit_->installEventFilter(this);
+    searchBtn_ = new QPushButton(tr("搜尋"));
+    auto* srow = new QHBoxLayout;
+    srow->addWidget(new QLabel(tr("搜尋欄位")));
+    srow->addWidget(fieldCombo_);
+    srow->addWidget(keywordEdit_, 1);
+    srow->addWidget(searchBtn_);
+    cpl->addLayout(srow);
+
+    // 表格顯示「序號 + 所有資料欄位」，欄位多時可橫向捲動、拖曳調整欄寬
+    auto makeTable = [this]() {
+        auto* t = new QTableWidget(0, 1 + int(in_.data.fields.size()));
+        QStringList hd{ tr("序號") };
+        hd << in_.data.fields;
+        t->setHorizontalHeaderLabels(hd);
+        t->setSelectionBehavior(QAbstractItemView::SelectRows);
+        t->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        t->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        t->setAlternatingRowColors(true);
+        t->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+        t->verticalHeader()->setVisible(false);
+        t->verticalHeader()->setDefaultSectionSize(22);
+        t->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        t->setMinimumHeight(uiscale::px(120));      // 太高的最小高度會讓小螢幕的視窗放不下
+        return t;
+        };
+    hitTable_ = makeTable();
+    hitTable_->installEventFilter(this);
+    pickedTable_ = makeTable();
+    pickedTable_->installEventFilter(this);
+    hitLabel_ = new QLabel(tr("搜尋結果：尚未搜尋"));
+    pickedLabel_ = new QLabel;
+    addSelBtn_ = new QPushButton(tr("加入選取 ▶ (Enter)"));
+    addAllBtn_ = new QPushButton(tr("全部加入 ▶"));
+    removeBtn_ = new QPushButton(tr("◀ 移除選取 (Del)"));
+    clearBtn_ = new QPushButton(tr("清空清單"));
+    for (auto* b : { searchBtn_, addSelBtn_, addAllBtn_, removeBtn_, clearBtn_ }) b->setAutoDefault(false);
+
+    auto* leftW = new QWidget;
+    auto* lcol = new QVBoxLayout(leftW);
+    lcol->setContentsMargins(0, 0, 0, 0);
+    lcol->addWidget(hitLabel_);
+    lcol->addWidget(hitTable_, 1);
+    auto* lbt = new QHBoxLayout;
+    lbt->addWidget(addSelBtn_);
+    lbt->addWidget(addAllBtn_);
+    lbt->addStretch(1);
+    lcol->addLayout(lbt);
+    auto* rightW = new QWidget;
+    auto* rcol = new QVBoxLayout(rightW);
+    rcol->setContentsMargins(0, 0, 0, 0);
+    rcol->addWidget(pickedLabel_);
+    rcol->addWidget(pickedTable_, 1);
+    auto* rbt = new QHBoxLayout;
+    rbt->addWidget(removeBtn_);
+    rbt->addWidget(clearBtn_);
+    rbt->addStretch(1);
+    rcol->addLayout(rbt);
+    auto* tableSplit = new QSplitter(Qt::Horizontal);       // 左右可拖曳調整寬度
+    tableSplit->addWidget(leftW);
+    tableSplit->addWidget(rightW);
+    tableSplit->setChildrenCollapsible(false);
+    tableSplit->setStretchFactor(0, 1);
+    tableSplit->setStretchFactor(1, 1);
+    cpl->addWidget(tableSplit, 1);
+    auto* keyHint = new QLabel(tr("快捷鍵：搜尋框 Enter = 搜尋、↓ = 跳到結果　|　結果表 Enter = 加入選取 (Ctrl+A 全選)、"
+        "雙擊 = 加入　|　清單 Delete / Backspace = 移除、雙擊 = 移除　|　Ctrl+F = 回到搜尋框"));
+    keyHint->setStyleSheet(QStringLiteral("color: gray;"));
+    keyHint->setWordWrap(true);
+    cpl->addWidget(keyHint);
+    customPanel_->setVisible(false);
+    refreshCustomUi();
+
     skipCheck_ = new QCheckBox(tr("略過有問題的資料 (版面用到的欄位空白、找不到圖片、重名)"));
     skipCheck_->setChecked(true);
     skipCheck_->setToolTip(tr("取消勾選時，有問題的資料仍會列印 (缺少的欄位/圖片會是空白或提示框)"));
@@ -246,15 +359,18 @@ void PrintDialog::buildUi() {
     rl->addWidget(radioCurrent_);
     rl->addWidget(radioVisible_);
     rl->addWidget(rrow);
+    rl->addWidget(radioCustom_);
     rl->addWidget(skipCheck_);
     rl->addStretch(1);
     rl->addWidget(summaryLabel_);
     top->addWidget(rangeBox_, 2);
     root->addLayout(top);
+    root->addWidget(customPanel_, 2);      // 自訂清單面板：整個視窗寬度，選了「自訂清單」才顯示
 
     if (in_.previewOnly) {
         radioVisible_->setEnabled(false);
         radioRange_->setEnabled(false);
+        radioCustom_->setEnabled(false);
         fromSpin_->setEnabled(false);
         toSpin_->setEnabled(false);
     }
@@ -274,6 +390,22 @@ void PrintDialog::buildUi() {
     root->addWidget(currentLabel_);
 
     // ------------------------------------------------ 逐筆進度表 + Log
+    auto* labelRow = new QHBoxLayout;
+    labelRow->addWidget(new QLabel(tr("進度表顯示欄位：")));
+    for (int k = 0; k < 2; ++k) {
+        labelCombo_[k] = new QComboBox;
+        if (k == 1) labelCombo_[k]->addItem(tr("(不顯示)"), QString());
+        for (const QString& f : in_.data.fields) labelCombo_[k]->addItem(f, f);
+        const int idx = labelCombo_[k]->findData(labelFields_.value(k));
+        labelCombo_[k]->setCurrentIndex(idx >= 0 ? idx : 0);
+        labelCombo_[k]->setMinimumWidth(uiscale::px(110));
+        labelCombo_[k]->setToolTip(tr("進度表與列印記錄用這些欄位辨識每一筆資料；測試模式輸出的圖檔檔名用第 1 個欄位。\n選擇會記住，下次開啟自動套用。"));
+        labelRow->addWidget(labelCombo_[k]);
+        connect(labelCombo_[k], QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { applyLabelFields(); });
+    }
+    labelRow->addStretch(1);
+    root->addLayout(labelRow);
+
     auto* split = new QSplitter(Qt::Vertical);
     table_ = new QTableWidget(0, 5);
     table_->setHorizontalHeaderLabels({ tr("序號"), labelFields_.value(0, tr("資料")), labelFields_.value(1), tr("狀態"), tr("訊息") });
@@ -346,6 +478,37 @@ void PrintDialog::buildUi() {
     connect(fromSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, replan](int) { if (radioRange_->isChecked()) replan(); });
     connect(toSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, replan](int) { if (radioRange_->isChecked()) replan(); });
     connect(skipCheck_, &QCheckBox::toggled, this, replan);
+    connect(radioCustom_, &QRadioButton::toggled, this, [this, replan](bool on) {
+        customPanel_->setVisible(on);
+        if (on) {       // 自動放大視窗，方便看欄位多的資料；大小依「這個視窗所在的螢幕」與介面大小決定，不會超出螢幕
+            if (!property("preCustomSize").isValid()) setProperty("preCustomSize", size());   // 記住原本大小，取消自訂清單時還原
+            const QRect av = uiscale::availableGeometry(this);
+            const int fw = frameGeometry().width() - width(), fh = frameGeometry().height() - height();   // 邊框與標題列
+            const int maxW = av.width() - fw, maxH = av.height() - fh;
+            const int w = qMin(qMax(width(), uiscale::px(1300)), maxW);
+            const int h = qMin(qMax(height(), uiscale::px(900)), maxH);
+            resize(w, h);
+            uiscale::clampToScreen(this);       // 放大後若跑出螢幕，移回螢幕內
+        }
+        else if (property("preCustomSize").isValid()) {
+            resize(property("preCustomSize").toSize());
+            setProperty("preCustomSize", QVariant());
+            uiscale::clampToScreen(this);
+        }
+        replan();
+        });
+    connect(searchBtn_, &QPushButton::clicked, this, [this] { runSearch(); });
+    connect(addSelBtn_, &QPushButton::clicked, this, [this] { addToCustom(rowsOfSelection(hitTable_)); });
+    connect(addAllBtn_, &QPushButton::clicked, this, [this] { addToCustom(hitRows_); });
+    connect(hitTable_, &QTableWidget::cellDoubleClicked, this, [this](int r, int) {
+        if (auto* it = hitTable_->item(r, 0)) addToCustom({ it->data(Qt::UserRole).toInt() });
+        });
+    connect(removeBtn_, &QPushButton::clicked, this, [this] { removeFromCustom(); });
+    connect(pickedTable_, &QTableWidget::cellDoubleClicked, this, [this](int r, int) {
+        pickedTable_->selectRow(r);
+        removeFromCustom();
+        });
+    connect(clearBtn_, &QPushButton::clicked, this, [this] { customRows_.clear(); refreshCustomUi(); });
 
     connect(startBtn_, &QPushButton::clicked, this, [this] { startJob(); });
     connect(cancelBtn_, &QPushButton::clicked, this, [this] { requestCancel(); });
@@ -431,10 +594,29 @@ void PrintDialog::updateModeUi() {
     startBtn_->setText(dry ? tr("輸出圖片") : tr("開始列印"));
 }
 
+void PrintDialog::applyLabelFields() {
+    if (!labelCombo_[0] || !labelCombo_[1] || !table_) return;
+    labelFields_.clear();
+    labelFields_ << labelCombo_[0]->currentData().toString();
+    const QString f2 = labelCombo_[1]->currentData().toString();
+    if (!f2.isEmpty()) labelFields_ << f2;
+    {
+        QSettings s = appSettings();
+        s.beginGroup(QStringLiteral("print"));
+        s.setValue(QStringLiteral("labelField1"), labelFields_.value(0));
+        s.setValue(QStringLiteral("labelField2"), labelFields_.value(1));
+    }
+    table_->setHorizontalHeaderItem(1, new QTableWidgetItem(labelFields_.value(0, tr("資料"))));
+    table_->setHorizontalHeaderItem(2, new QTableWidgetItem(labelFields_.value(1)));
+    for (int i = 0; i < items_.size(); ++i) updateRow(i);
+}
+
 void PrintDialog::setControlsEnabled(bool on) {
+    if (labelCombo_[0]) { labelCombo_[0]->setEnabled(on); labelCombo_[1]->setEnabled(on); }   // 列印中不改，免得輸出檔名中途改變
     printerBox_->setEnabled(on);
     dryBox_->setEnabled(on);
     rangeBox_->setEnabled(on);
+    customPanel_->setEnabled(on);
     startBtn_->setEnabled(on && printableCount_ > 0);
     cancelBtn_->setEnabled(!on);
     exportLogBtn_->setEnabled(on);
@@ -455,12 +637,149 @@ QList<int> PrintDialog::selectedRows() const {
     else if (radioVisible_->isChecked()) {
         for (int r : in_.visibleRows) if (r >= 0 && r < n) rows << r;
     }
+    else if (radioCustom_->isChecked()) {
+        for (int r : customRows_) if (r >= 0 && r < n) rows << r;
+    }
     else {
         const int a = qMin(fromSpin_->value(), toSpin_->value());
         const int b = qMax(fromSpin_->value(), toSpin_->value());
         for (int r = a - 1; r <= b - 1 && r < n; ++r) rows << r;
     }
     return rows;
+}
+
+// ============================================================ 自訂清單 ===
+
+void PrintDialog::fillRowTable(QTableWidget* t, const QList<int>& rows, bool fitColumns) const {
+    const QStringList& fields = in_.data.fields;
+    t->setUpdatesEnabled(false);
+    t->clearContents();
+    t->setRowCount(rows.size());
+    for (int i = 0; i < rows.size(); ++i) {
+        const int r = rows[i];
+        const card::Record& rec = in_.data.rows[r];
+        auto* no = new QTableWidgetItem(QString::number(r + 1));
+        no->setData(Qt::UserRole, r);                       // 記住在 data.rows 內的索引
+        t->setItem(i, 0, no);
+        for (int f = 0; f < fields.size(); ++f)
+            t->setItem(i, f + 1, new QTableWidgetItem(rec.value(fields[f])));
+    }
+    if (fitColumns) {                                        // 依內容調整欄寬 (每欄最寬 240 px，超過可自行拖曳)
+        t->resizeColumnsToContents();
+        for (int c = 0; c < t->columnCount(); ++c)
+            if (t->columnWidth(c) > 240) t->setColumnWidth(c, 240);
+    }
+    t->setUpdatesEnabled(true);
+}
+
+void PrintDialog::markHitsInList() {
+    QSet<int> have;
+    for (int r : customRows_) have.insert(r);
+    for (int i = 0; i < hitTable_->rowCount(); ++i) {
+        auto* no = hitTable_->item(i, 0);
+        if (!no) continue;
+        const int r = no->data(Qt::UserRole).toInt();
+        const bool in = have.contains(r);
+        no->setText(in ? QStringLiteral("✓ %1").arg(r + 1) : QString::number(r + 1));
+        for (int c = 0; c < hitTable_->columnCount(); ++c)
+            if (auto* x = hitTable_->item(i, c)) x->setForeground(in ? QBrush(Qt::gray) : QBrush());
+    }
+}
+
+void PrintDialog::runSearch() {
+    const QString field = fieldCombo_->currentData().toString();      // 空 = 全部欄位
+    QStringList keys;
+    for (const QString& k : keywordEdit_->text().split(QRegularExpression(QStringLiteral("[,;，；、]")))) {
+        const QString t = k.trimmed();
+        if (!t.isEmpty()) keys << t;
+    }
+    hitRows_.clear();
+    const int n = int(in_.data.rows.size());
+    for (int r = 0; r < n; ++r) {
+        const card::Record& rec = in_.data.rows[r];
+        bool hit = keys.isEmpty();                                     // 沒輸入關鍵字 = 列出全部
+        for (int i = 0; !hit && i < keys.size(); ++i) {
+            if (field.isEmpty()) {
+                for (const QString& f : in_.data.fields)
+                    if (rec.value(f).contains(keys[i], Qt::CaseInsensitive)) { hit = true; break; }
+            }
+            else hit = rec.value(field).contains(keys[i], Qt::CaseInsensitive);
+        }
+        if (hit) hitRows_ << r;
+    }
+    fillRowTable(hitTable_, hitRows_, true);
+    markHitsInList();
+    hitLabel_->setText(tr("搜尋結果：%1 筆 (✓ = 已在清單內)").arg(hitRows_.size()));
+}
+
+void PrintDialog::addToCustom(const QList<int>& rows) {
+    if (rows.isEmpty()) return;
+    QSet<int> have;
+    for (int r : customRows_) have.insert(r);
+    for (int r : rows) {
+        if (have.contains(r)) continue;                                // 已在清單內就不重複加入
+        have.insert(r);
+        customRows_ << r;
+    }
+    refreshCustomUi();
+    pickedTable_->scrollToBottom();
+}
+
+void PrintDialog::removeFromCustom() {
+    const QModelIndexList sel = pickedTable_->selectionModel()->selectedRows();
+    const QList<int> del = rowsOfSelection(pickedTable_);
+    if (del.isEmpty()) return;
+    int firstRow = pickedTable_->rowCount();
+    for (const QModelIndex& m : sel) firstRow = qMin(firstRow, m.row());
+    QSet<int> gone;
+    for (int r : del) gone.insert(r);
+    QList<int> keep;
+    for (int r : customRows_) if (!gone.contains(r)) keep << r;
+    customRows_ = keep;
+    refreshCustomUi();
+    if (pickedTable_->rowCount() > 0)                                  // 連續按 Delete 時，選取會停在原位置的下一筆
+        pickedTable_->selectRow(qMin(firstRow, pickedTable_->rowCount() - 1));
+}
+
+void PrintDialog::refreshCustomUi() {
+    fillRowTable(pickedTable_, customRows_, pickedTable_->rowCount() == 0);
+    markHitsInList();
+    pickedLabel_->setText(tr("列印清單：%1 筆 (依加入順序列印)").arg(customRows_.size()));
+    if (radioCustom_->isChecked()) { retryMode_ = false; rebuildPlan(); }   // 清單變動 → 重新規劃
+}
+
+bool PrintDialog::eventFilter(QObject* obj, QEvent* ev) {
+    if (ev->type() == QEvent::KeyPress && (obj == keywordEdit_ || obj == hitTable_ || obj == pickedTable_)) {
+        const auto* ke = static_cast<QKeyEvent*>(ev);
+        const int k = ke->key();
+        const bool enter = (k == Qt::Key_Return || k == Qt::Key_Enter);
+        if (obj != keywordEdit_ && k == Qt::Key_F && (ke->modifiers() & Qt::ControlModifier)) {
+            keywordEdit_->setFocus();
+            keywordEdit_->selectAll();
+            return true;
+        }
+        if (obj == keywordEdit_) {
+            if (enter) {
+                runSearch();
+                if (!hitRows_.isEmpty()) hitTable_->setFocus();        // 搜尋完直接把焦點交給結果表，可立刻選取
+                return true;
+            }
+            if (k == Qt::Key_Down && hitTable_->rowCount() > 0) {
+                hitTable_->setFocus();
+                if (!hitTable_->currentIndex().isValid()) hitTable_->selectRow(0);
+                return true;
+            }
+        }
+        else if (obj == hitTable_) {
+            if (enter) { addToCustom(rowsOfSelection(hitTable_)); return true; }
+        }
+        else {      // pickedTable_
+            if (k == Qt::Key_Delete || k == Qt::Key_Backspace) { removeFromCustom(); return true; }
+            if (enter) return true;
+        }
+        // 上面都吃掉 Enter，避免觸發預設按鈕「開始列印」
+    }
+    return QDialog::eventFilter(obj, ev);
 }
 
 // 回傳這一筆資料「會讓卡面不完整」的原因 (空 = 沒問題)。只檢查「版面真的用到」的東西。

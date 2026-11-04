@@ -33,6 +33,13 @@ namespace topcoat {
 
     std::vector<std::wstring> escapes(const TopcoatSpec& spec) {
         std::vector<std::wstring> out;
+        if (spec.base == TopcoatSpec::Base::None) {
+            // 完全不鍍膜：~TA 會把整面鍍膜關閉，只留下一個極小的區域 (鍍膜區 / 移除鍍膜在此模式下忽略)
+            out.push_back(escape(L"TA", { TopcoatRect{ 0, 0, kNoTopcoatDotMm, kNoTopcoatDotMm } }));
+            const std::wstring pb = escape(L"PB", spec.blockAreas);
+            if (!pb.empty()) out.push_back(pb);
+            return out;
+        }
         for (const auto& e : { escape(L"TA", spec.addAreas), escape(L"TR", spec.removeAreas), escape(L"PB", spec.blockAreas) })
             if (!e.empty()) out.push_back(e);
         return out;
@@ -41,6 +48,7 @@ namespace topcoat {
     std::wstring frontTicketXml(const TopcoatSpec& spec) {
         switch (spec.base) {
         case TopcoatSpec::Base::DriverDefault:
+        case TopcoatSpec::Base::None:            // 完全不鍍膜：不靠 PrintTicket，由 escapes() 的 ~TA 關閉鍍膜
             return std::wstring();
         case TopcoatSpec::Base::All:
             return L"<psf:Feature name=\"ns0000:PageFrontPrintAndTopcoat\"><psf:Option name=\"ns0000:All\" /></psf:Feature>";
@@ -90,6 +98,7 @@ namespace topcoat {
         switch (spec.base) {
         case TopcoatSpec::Base::DriverDefault: s = L"沿用驅動程式設定"; break;
         case TopcoatSpec::Base::All: s = L"全卡鍍膜 (PrintTicket)"; break;
+        case TopcoatSpec::Base::None: s = L"完全不鍍膜 (以 ~TA 關閉整面鍍膜)"; break;
         case TopcoatSpec::Base::Except: {
             s = L"全卡鍍膜，避開";
             switch (spec.exception) {

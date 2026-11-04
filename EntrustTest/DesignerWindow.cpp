@@ -215,7 +215,7 @@ namespace {
 // ============================================================ construction ===
 
 DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle(tr("卡面設計器 (階段 4)"));
+    setWindowTitle(QStringLiteral("Entrust Card Tool"));
     uiscale::fitWindowToScreen(this, 1360, 840);     // 依螢幕可用範圍決定視窗大小 (不會超出螢幕)
 
     // 預設版面：照片、姓名、學號、系所
@@ -553,6 +553,21 @@ void DesignerWindow::buildMenus() {
             if (gi->type() == RegionItem::Type) gi->setVisible(on);
         });
     mView->addAction(actShowRegions_);
+    actRegionOutline_ = newAction(this, tr("鍍膜範圍只畫外框"), QKeySequence(), tr("鍍膜範圍只畫虛線外框、不填色，不會遮住卡面設計 (只影響編輯畫面，不影響列印)"), nullptr);
+    actRegionOutline_->setCheckable(true);
+    connect(actRegionOutline_, &QAction::toggled, this, [this](bool on) { RegionItem::outlineOnly() = on; refreshRegionItemsView(); });
+    mView->addAction(actRegionOutline_);
+    actRegionEdit_ = newAction(this, tr("編輯鍍膜範圍"), QKeySequence(), tr("開啟時只能操作鍍膜範圍 (元素暫時不接受滑鼠)；關閉時鍍膜範圍不接受滑鼠，不會擋住卡面設計 (只影響編輯畫面)"), nullptr);
+    actRegionEdit_->setCheckable(true);
+    connect(actRegionEdit_, &QAction::toggled, this, [this](bool on) {
+        RegionItem::locked() = !on;
+        if (regionEditCheck_ && regionEditCheck_->isChecked() != on) {
+            const QSignalBlocker b(regionEditCheck_);
+            regionEditCheck_->setChecked(on);
+        }
+        refreshRegionItemsView();
+        });
+    mView->addAction(actRegionEdit_);
     actSnap_ = newAction(this, tr("對齊輔助線"), QKeySequence(), tr("拖曳 / 縮放時自動貼齊其他元素與卡面的邊、中心線 (拖曳時按住 Alt 可暫時停用)"), nullptr);
     actSnap_->setCheckable(true);
     actSnap_->setChecked(true);
@@ -1167,6 +1182,7 @@ void DesignerWindow::rebuildScene(bool refit) {
     actPortrait_->setChecked(portrait);
     updating_ = false;
 
+    refreshRegionItemsView();              // 重建場景後，依「編輯鍍膜範圍」模式設定滑鼠狀態
     refreshList();
     populatePanel(nullptr);
     refreshTopcoatPanel();
@@ -1996,7 +2012,7 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
     auto* baseBox = new QGroupBox(tr("基本設定 (PrintTicket)"));
     auto* bf = new QFormLayout(baseBox);
     topBaseCombo_ = new QComboBox;
-    topBaseCombo_->addItems({ tr("沿用驅動程式設定"), tr("全卡鍍膜"), tr("全卡鍍膜，但避開…") });
+    topBaseCombo_->addItems({ tr("沿用驅動程式設定"), tr("全卡鍍膜"), tr("全卡鍍膜，但避開…"), tr("完全不鍍膜") });   // 順序 = card::TopcoatBase 的值
     topExcCombo_ = new QComboBox;
     topExcCombo_->addItems({ tr("晶片 (ISO 7816)"), tr("磁條 JIS"), tr("磁條 ISO 2 軌"), tr("磁條 ISO 3 軌") });
     bf->addRow(tr("鍍膜"), topBaseCombo_);
@@ -2007,10 +2023,20 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
     auto* regBox = new QGroupBox(tr("額外範圍 (Escape)"));
     auto* rl = new QVBoxLayout(regBox);
     auto* hint = new QLabel(tr("鍍膜區：只在範圍內鍍膜 (其餘不鍍)\n移除鍍膜：範圍內不鍍膜\n列印阻擋：範圍內不列印\n"
-        "範圍可在卡面上拖曳，選取後拖右下角方塊調整大小 (座標以卡面左上角為原點，單位 mm)。"));
+        "選「完全不鍍膜」時，鍍膜區 / 移除鍍膜會被忽略 (只有列印阻擋有效)。\n"
+        "範圍可在卡面上拖曳，選取後拖右下角方塊調整大小 (座標以卡面左上角為原點，單位 mm)。\n"
+        "平常 (「編輯鍍膜範圍」未勾選) 範圍只畫虛線外框、不接受滑鼠，不會擋到卡面設計。\n"
+        "要調整範圍：按「新增範圍」，或在下方清單選取範圍，會自動進入編輯模式 (此時元素暫時不接受滑鼠)；選取元素後會自動離開。"));
     hint->setWordWrap(true);
     hint->setStyleSheet(QStringLiteral("color:#666;"));
     rl->addWidget(hint);
+
+    regionEditCheck_ = new QCheckBox(tr("編輯鍍膜範圍 (開啟時只能操作範圍；關閉時範圍不會擋到卡面設計)"));
+    regionEditCheck_->setToolTip(tr("平常請保持關閉：鍍膜範圍只顯示虛線外框，滑鼠會直接穿透到卡面元素。\n新增範圍或從下方清單選取範圍時會自動開啟。"));
+    rl->addWidget(regionEditCheck_);
+    connect(regionEditCheck_, &QCheckBox::toggled, this, [this](bool on) {
+        if (actRegionEdit_ && actRegionEdit_->isChecked() != on) actRegionEdit_->setChecked(on);
+        });
 
     regionList_ = new QListWidget;
     regionList_->setMinimumHeight(uiscale::px(90));
@@ -2068,6 +2094,7 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
         if (updating_) return;
         const QString id = row >= 0 ? regionList_->item(row)->data(Qt::UserRole).toString() : QString();
         populateRegionEditor(layout_.topcoat.find(id));
+        if (!id.isEmpty() && actRegionEdit_ && !actRegionEdit_->isChecked()) actRegionEdit_->setChecked(true);   // 從清單選範圍 = 要編輯它
         if (RegionItem* it = findRegionItem(id)) {
             scene_->clearSelection();
             it->setSelected(true);                 // 範圍被隱藏時無法選取，編輯欄位仍可使用
@@ -2120,6 +2147,7 @@ QString DesignerWindow::currentRegionId() const {
 }
 
 void DesignerWindow::addRegion() {
+    if (actRegionEdit_ && !actRegionEdit_->isChecked()) actRegionEdit_->setChecked(true);   // 新增範圍 = 要編輯它，自動進入編輯模式
     commitUndo();
     card::TopcoatRegion r;
     r.id = layout_.topcoat.nextId();
@@ -2242,6 +2270,21 @@ void DesignerWindow::onRegionItemChanged(const QString& id) {
     refreshTopcoatPreview();
 }
 
+void DesignerWindow::refreshRegionItemsView() {
+    if (!cardItem_) return;
+    const bool editing = !RegionItem::locked();
+    for (QGraphicsItem* gi : cardItem_->childItems()) {
+        if (gi->type() == RegionItem::Type) {
+            if (!editing && gi->isSelected()) gi->setSelected(false);          // 離開編輯模式：不留範圍的選取框
+            gi->update();
+        }
+        else if (gi->type() == ElementItem::Type) {
+            gi->setAcceptedMouseButtons(editing ? Qt::NoButton : Qt::AllButtons);   // 編輯範圍時，元素不接受滑鼠
+            if (editing && gi->isSelected()) gi->setSelected(false);
+        }
+    }
+}
+
 void DesignerWindow::refreshTopcoatPreview() {
     const ::TopcoatSpec spec = card::toTopcoatSpec(layout_.topcoat);
     QString s;
@@ -2253,6 +2296,11 @@ void DesignerWindow::refreshTopcoatPreview() {
         const auto esc = topcoat::escapes(spec);
         if (esc.empty()) s += tr("\nEscape：(無)");
         for (const auto& e : esc) s += QStringLiteral("\n") + QString::fromStdWString(e);
+    }
+    if (spec.base == TopcoatSpec::Base::None) {
+        s += tr("\n\n完全不鍍膜：PrintTicket 不送出，改以上面的 ~TA 指令關閉整面鍍膜。");
+        if (!spec.addAreas.empty() || !spec.removeAreas.empty())
+            s += tr("\n⚠ 鍍膜區 / 移除鍍膜在此模式下不會送出 (只有列印阻擋有效)。");
     }
     if (layout_.orientation == card::Orientation::Portrait && !spec.isDefault())
         s += tr("\n\n直式卡面：以上為設計座標，列印時會依旋轉方向換算成橫式座標。");
@@ -2428,12 +2476,14 @@ void DesignerWindow::onSelectionChanged() {
     refreshImageMatches(false);            // 「圖片」欄顯示目前選取的動態圖片的比對結果 (條件沒變就不重算)
     if (it && propertyDock_->isVisible()) propertyDock_->raise();
     if (rg) {
+        if (actRegionEdit_ && !actRegionEdit_->isChecked()) actRegionEdit_->setChecked(true);
         syncRegionListSelection(rg->id());
         populateRegionEditor(layout_.topcoat.find(rg->id()));
         topcoatDock_->show();
         topcoatDock_->raise();
     }
     else if (it) {
+        if (actRegionEdit_ && actRegionEdit_->isChecked()) actRegionEdit_->setChecked(false);   // 選了元素 = 回到設計模式
         syncRegionListSelection(QString());
         populateRegionEditor(nullptr);
     }

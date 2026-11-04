@@ -109,6 +109,7 @@ private:
     void editSelectedRegion(const std::function<void(card::TopcoatRegion&)>& fn);
     void onRegionItemChanged(const QString& id);
     void refreshTopcoatPreview();
+    void refreshRegionItemsView();                 // 「編輯鍍膜範圍 / 只畫外框」切換後，更新範圍與元素的滑鼠狀態
 
     // 卡面底圖：匯入卡面的圖當設計參考，可選擇列印時印出或不印出
     void importBackground();
@@ -190,6 +191,9 @@ private:
     QAction* actLandscape_ = nullptr;
     QAction* actPortrait_ = nullptr;
     QAction* actShowRegions_ = nullptr;
+    QAction* actRegionOutline_ = nullptr;
+    QAction* actRegionEdit_ = nullptr;     // 編輯鍍膜範圍模式 (開啟時只能操作範圍，元素暫時不接受滑鼠)
+    QCheckBox* regionEditCheck_ = nullptr;
     QAction* actSnap_ = nullptr;
     QAction* actImportBg_ = nullptr;
     QAction* actClearBg_ = nullptr;

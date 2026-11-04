@@ -51,6 +51,7 @@ public:
     bool exportLog(const QString& path) const;          // 完整 Log (含設定摘要)
     bool exportResultCsv(const QString& path) const;    // 逐筆結果 (可用來找出要補印的資料)
 
+    bool eventFilter(QObject* obj, QEvent* ev) override;   // 搜尋框 / 搜尋結果表按 Enter 時不要觸發「開始列印」
     void reject() override;                              // 列印中不允許關閉視窗 (按 Esc / 關閉 / 關閉鈕都會經過這裡)
 
 private:
@@ -76,6 +77,15 @@ private:
     void rebuildPlan();
     void updateSummary();
     void updateRow(int i);
+    void applyLabelFields();                   // 「進度表顯示欄位」下拉選單變更：更新標題 / 所有列 / 記住選擇
+
+    // 自訂清單：依欄位搜尋 → 加入清單 (可不連續)
+    void runSearch();
+    void addToCustom(const QList<int>& rows);
+    void removeFromCustom();
+    void refreshCustomUi();
+    void fillRowTable(QTableWidget* t, const QList<int>& rows, bool fitColumns) const;
+    void markHitsInList();      // 搜尋結果中「已加入清單」的資料加上 ✓ 並變灰
 
     // 執行
     void startJob();
@@ -96,6 +106,7 @@ private:
     PrintInput in_;
     QSet<QString> usedFields_;                 // 版面中 {欄位} 用到的欄位
     QStringList labelFields_;                  // 進度表 / Log 用來辨識每一筆資料的欄位 (最多 2 個，依資料欄位而定)
+    QComboBox* labelCombo_[2] = { nullptr, nullptr };   // 進度表顯示欄位 (第 2 個可選「不顯示」)；選擇會記在設定檔
     bool hasAutoImage_ = false;                // 有「動態圖片」元素 (依資料帶入)
     QHash<QString, QHash<QString, int>> matchValueCount_;   // 動態圖片元素 id -> (比對欄位的值 -> 在整份資料出現幾次，偵測資料重名)
 
@@ -139,6 +150,22 @@ private:
     QRadioButton* radioRange_ = nullptr;
     QSpinBox* fromSpin_ = nullptr;
     QSpinBox* toSpin_ = nullptr;
+    // 自訂清單
+    QRadioButton* radioCustom_ = nullptr;
+    QWidget* customPanel_ = nullptr;
+    QComboBox* fieldCombo_ = nullptr;
+    QLineEdit* keywordEdit_ = nullptr;
+    QPushButton* searchBtn_ = nullptr;
+    QPushButton* addSelBtn_ = nullptr;
+    QPushButton* addAllBtn_ = nullptr;
+    QPushButton* removeBtn_ = nullptr;
+    QPushButton* clearBtn_ = nullptr;
+    QLabel* hitLabel_ = nullptr;
+    QLabel* pickedLabel_ = nullptr;
+    QTableWidget* hitTable_ = nullptr;      // 搜尋結果
+    QTableWidget* pickedTable_ = nullptr;   // 已加入的列印清單
+    QList<int> hitRows_;                    // 搜尋結果 (data.rows 索引)
+    QList<int> customRows_;                 // 列印清單 (data.rows 索引，依加入順序)
     QCheckBox* skipCheck_ = nullptr;
     QLabel* summaryLabel_ = nullptr;
     // 進度
