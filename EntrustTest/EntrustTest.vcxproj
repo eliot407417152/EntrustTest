@@ -144,6 +144,7 @@
     <ClInclude Include="ExcelReader.h" />
     <ClInclude Include="ImageMatcher.h" />
     <ClInclude Include="PrintDialog.h" />
+    <ClInclude Include="QrCodeGen.h" />
     <ClInclude Include="RegionItem.h" />
     <ClInclude Include="SnapGuides.h" />
     <ClInclude Include="Stdafx.h" />

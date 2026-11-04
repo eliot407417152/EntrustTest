@@ -7,8 +7,18 @@
 namespace card {
 
     namespace {
-        QString typeToStr(ElementType t) { return t == ElementType::Image ? QStringLiteral("image") : QStringLiteral("text"); }
-        ElementType strToType(const QString& s) { return s == QLatin1String("image") ? ElementType::Image : ElementType::Text; }
+        QString typeToStr(ElementType t) {
+            if (t == ElementType::Image) return QStringLiteral("image");
+            if (t == ElementType::Barcode) return QStringLiteral("barcode");
+            if (t == ElementType::QRCode) return QStringLiteral("qrcode");
+            return QStringLiteral("text");
+        }
+        ElementType strToType(const QString& s) {
+            if (s == QLatin1String("image")) return ElementType::Image;
+            if (s == QLatin1String("barcode")) return ElementType::Barcode;
+            if (s == QLatin1String("qrcode")) return ElementType::QRCode;
+            return ElementType::Text;
+        }
 
         QString alignToStr(HAlign a) {
             switch (a) {
@@ -41,10 +51,28 @@ namespace card {
         }
     }
 
+    // ------------------------------------------------------------ BarcodeType ---
+    namespace {
+        struct BcInfo { const char* key; const char* name; };
+        const BcInfo kBc[] = {
+            {"code128", "Code 128"}, {"code39", "Code 39"}, {"ean13", "EAN-13"}, {"ean8", "EAN-8"},
+            {"upca", "UPC-A"}, {"itf", "ITF (Interleaved 2 of 5)"}, {"codabar", "Codabar"} };
+    }
+    const QStringList& barcodeTypeNames() {
+        static const QStringList l = [] { QStringList r; for (const auto& b : kBc) r << QString::fromUtf8(b.name); return r; }();
+        return l;
+    }
+    QString barcodeTypeKey(BarcodeType t) { return QString::fromLatin1(kBc[static_cast<int>(t)].key); }
+    BarcodeType barcodeTypeFromKey(const QString& k) {
+        for (int i = 0; i < int(sizeof(kBc) / sizeof(kBc[0])); ++i) if (k == QLatin1String(kBc[i].key)) return static_cast<BarcodeType>(i);
+        return BarcodeType::Code39;
+    }
+
     // ------------------------------------------------------------------ Element ---
 
     bool Element::isDynamic() const {
-        if (type == ElementType::Image && imageSource == ImageSource::Dynamic) return true;   // 依資料帶入的圖片
+        if (type == ElementType::Image && imageSource == ImageSource::Dynamic) return true;
+        if ((type == ElementType::Barcode || type == ElementType::QRCode) && barcodeSource == ImageSource::Dynamic) return true;
         const QString& s = (type == ElementType::Text) ? text : imagePath;
         const int a = s.indexOf(QLatin1Char('{'));
         return a >= 0 && s.indexOf(QLatin1Char('}'), a) > a;
@@ -66,6 +94,11 @@ namespace card {
         o["italic"] = italic;
         o["color"] = color.name(QColor::HexArgb);
         o["align"] = alignToStr(align);
+        o["barcodeSource"] = barcodeSource == ImageSource::Fixed ? QStringLiteral("fixed") : QStringLiteral("dynamic");
+        o["barcodeType"] = barcodeTypeKey(barcodeType);
+        o["barcodeValue"] = barcodeValue;
+        o["qrEcc"] = qrEcc;
+        o["barcodeField"] = barcodeField;
         o["imagePath"] = imagePath;
         o["keepAspect"] = keepAspect;
         o["fitContent"] = fitContent;
@@ -96,6 +129,11 @@ namespace card {
         const QColor c(o.value("color").toString());
         if (c.isValid()) e.color = c;
         e.align = strToAlign(o.value("align").toString());
+        e.barcodeSource = o.value("barcodeSource").toString() == QLatin1String("dynamic") ? ImageSource::Dynamic : ImageSource::Fixed;
+        e.barcodeType = barcodeTypeFromKey(o.value("barcodeType").toString());   // 舊版面檔沒有此欄 = Code 39
+        e.barcodeValue = o.value("barcodeValue").toString(e.barcodeValue);
+        e.qrEcc = qBound(0, o.value("qrEcc").toInt(1), 3);
+        e.barcodeField = o.value("barcodeField").toString();
         e.imagePath = o.value("imagePath").toString();
         e.keepAspect = o.value("keepAspect").toBool(true);
         e.fitContent = o.value("fitContent").toBool(false);

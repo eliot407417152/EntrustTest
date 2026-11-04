@@ -189,7 +189,10 @@ namespace {
     };
 
     QString typeText(const card::Element& e) {
-        return e.type == card::ElementType::Text ? QStringLiteral("文字") : QStringLiteral("圖片");
+        if (e.type == card::ElementType::Text) return QStringLiteral("文字");
+        if (e.type == card::ElementType::Image) return QStringLiteral("圖片");
+        if (e.type == card::ElementType::QRCode) return QStringLiteral("QR Code");
+        return QStringLiteral("條碼");
     }
 
     QString listLabel(const card::Element& e) {
@@ -342,7 +345,7 @@ void DesignerWindow::buildUi() {
     connect(scene_, &QGraphicsScene::selectionChanged, this, [this] { onSelectionChanged(); });
 
     // ---- 面板 (都放進 QDockWidget，可由「檢視」選單重新開啟) ----
-    elementDock_ = new QDockWidget(tr("元素清單"), this);
+    elementDock_ = new QDockWidget(tr("元素清單 (上方 = 最上層)"), this);
     elementDock_->setObjectName(QStringLiteral("dockElements"));
     elementList_ = new QListWidget;
     elementDock_->setWidget(elementList_);
@@ -453,6 +456,8 @@ void DesignerWindow::buildMenus() {
 
     auto* actAddText = newAction(this, tr("新增文字"), QKeySequence(Qt::CTRL | Qt::Key_T), tr("在卡面新增一個文字元素"), [this] { addElement(card::ElementType::Text); });
     auto* actAddImage = newAction(this, tr("新增圖片"), QKeySequence(Qt::CTRL | Qt::Key_I), tr("在卡面新增一個圖片元素"), [this] { addElement(card::ElementType::Image); });
+    auto* actAddQr = newAction(this, tr("新增 QR Code"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R), tr("在卡面新增一個 QR Code 元素"), [this] { addElement(card::ElementType::QRCode); });
+    auto* actAddBarcode = newAction(this, tr("新增條碼"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_B), tr("在卡面新增一個 Code 39 條碼元素"), [this] { addElement(card::ElementType::Barcode); });
 
     // 刪除：Delete 與 Backspace 都可以；只在焦點位於「卡面」或「元素清單」時生效，
     // 避免在屬性面板輸入文字、按倒退鍵時誤刪元素。
@@ -499,8 +504,24 @@ void DesignerWindow::buildMenus() {
     mEdit->addSeparator();
     mEdit->addAction(actAddText);
     mEdit->addAction(actAddImage);
+    mEdit->addAction(actAddBarcode);
+    mEdit->addAction(actAddQr);
     mEdit->addSeparator();
     mEdit->addAction(actDelete_);
+    mEdit->addSeparator();
+    {
+        const QString names[4] = { tr("移到最上層"), tr("上移一層"), tr("下移一層"), tr("移到最下層") };
+        const QKeySequence keys[4] = { QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketRight), QKeySequence(Qt::CTRL | Qt::Key_BracketRight),
+            QKeySequence(Qt::CTRL | Qt::Key_BracketLeft), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketLeft) };
+        for (int k = 0; k < 4; ++k) {
+            actLayer_[k] = newAction(this, names[k], keys[k], tr("調整選取元素的覆蓋順序：%1").arg(names[k]), [this, k] { moveLayer(k); });
+            mEdit->addAction(actLayer_[k]);
+            elementList_->addAction(actLayer_[k]);
+            view_->addAction(actLayer_[k]);
+            actLayer_[k]->setEnabled(false);
+        }
+        elementList_->setContextMenuPolicy(Qt::ActionsContextMenu);   // 元素清單按右鍵也能調整
+    }
 
     actImportBg_ = newAction(this, tr("匯入卡面底圖…"), QKeySequence(), tr("匯入卡面的圖，墊在最底層方便對位文字與圖片；可選擇列印時印出或不印出"), [this] { importBackground(); });
     actClearBg_ = newAction(this, tr("移除卡面底圖"), QKeySequence(), tr("移除目前的卡面底圖"), [this] { clearBackground(); });
@@ -616,7 +637,12 @@ void DesignerWindow::buildMenus() {
     tb2->addWidget(caption(tr("元素")));
     tb2->addAction(actAddText);
     tb2->addAction(actAddImage);
+    tb2->addAction(actAddQr);
+    tb2->addAction(actAddBarcode);   // 新增條碼按鈕：放在「元素」工具列，與文字、圖片並列
     tb2->addAction(actDelete_);
+    tb2->addSeparator();
+    tb2->addWidget(caption(tr("層次")));
+    for (int k = 0; k < 4; ++k) tb2->addAction(actLayer_[k]);
     tb2->addSeparator();
     tb2->addWidget(caption(tr("檢視")));
     tb2->addAction(actFit);
@@ -646,6 +672,16 @@ void DesignerWindow::updateRecordLabel() {
 }
 
 void DesignerWindow::updateActionStates() {
+    {
+        ElementItem* sel = selectedItem();
+        int idx = -1;
+        if (sel) for (int i = 0; i < layout_.elements.size(); ++i) if (layout_.elements[i].id == sel->id()) { idx = i; break; }
+        const int last = layout_.elements.size() - 1;
+        if (actLayer_[0]) actLayer_[0]->setEnabled(idx >= 0 && idx < last);     // 已在最上層就不能再往上
+        if (actLayer_[1]) actLayer_[1]->setEnabled(idx >= 0 && idx < last);
+        if (actLayer_[2]) actLayer_[2]->setEnabled(idx > 0);
+        if (actLayer_[3]) actLayer_[3]->setEnabled(idx > 0);
+    }
     if (actDelete_) actDelete_->setEnabled(selectedItem() != nullptr || selectedRegion() != nullptr || !currentRegionId().isEmpty());
     const bool hasData = !data_.rows.isEmpty();
     if (actPrevRecord_) actPrevRecord_->setEnabled(hasData);
@@ -813,6 +849,55 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     imf->addRow(tr("垂直位置"), imageFocusYSpin_);
     root->addWidget(imageGroup_);
 
+    // --- 條碼：Code 39，固定內容或依 Excel 欄位動態帶入 ---
+    barcodeGroup_ = new QGroupBox(tr("條碼"));
+    auto* bcf = new QFormLayout(barcodeGroup_);
+    barcodeSourceCombo_ = new QComboBox;
+    barcodeSourceCombo_->addItem(tr("固定條碼 (每張卡都相同)"));
+    barcodeSourceCombo_->addItem(tr("動態條碼 (依每筆資料欄位)"));
+    bcf->addRow(tr("來源"), barcodeSourceCombo_);
+    barcodeTypeBox_ = new QWidget;
+    {
+        auto* f = new QFormLayout(barcodeTypeBox_);
+        f->setContentsMargins(0, 0, 0, 0);
+        barcodeTypeCombo_ = new QComboBox;
+        barcodeTypeCombo_->addItems(card::barcodeTypeNames());
+        f->addRow(tr("條碼類型"), barcodeTypeCombo_);
+    }
+    bcf->addRow(barcodeTypeBox_);
+    qrEccBox_ = new QWidget;                       // 只有 QR Code 元素才會顯示
+    {
+        auto* f = new QFormLayout(qrEccBox_);
+        f->setContentsMargins(0, 0, 0, 0);
+        qrEccCombo_ = new QComboBox;
+        qrEccCombo_->addItems({ tr("L (約 7%)"), tr("M (約 15%)"), tr("Q (約 25%)"), tr("H (約 30%)") });
+        qrEccCombo_->setToolTip(tr("容錯等級越高，卡面髒汙 / 刮損時越容易掃出來，但同樣內容的 QR Code 會變得更密。"));
+        f->addRow(tr("容錯等級"), qrEccCombo_);
+    }
+    bcf->addRow(qrEccBox_);
+    barcodeFixedBox_ = new QWidget;
+    {
+        auto* f = new QFormLayout(barcodeFixedBox_);
+        f->setContentsMargins(0, 0, 0, 0);
+        barcodeValueEdit_ = new QLineEdit;
+        barcodeValueEdit_->setPlaceholderText(tr("輸入條碼內容，例如 1234567890"));
+        f->addRow(tr("條碼內容"), barcodeValueEdit_);
+    }
+    bcf->addRow(barcodeFixedBox_);
+    barcodeDynamicBox_ = new QWidget;
+    {
+        auto* f = new QFormLayout(barcodeDynamicBox_);
+        f->setContentsMargins(0, 0, 0, 0);
+        barcodeFieldCombo_ = new QComboBox;
+        barcodeFieldCombo_->addItems(card::fieldNames());
+        f->addRow(tr("資料欄位"), barcodeFieldCombo_);
+    }
+    bcf->addRow(barcodeDynamicBox_);
+    barcodeHint_ = new QLabel(tr("Code 128：可含英數與符號 (純數字自動壓縮)；Code 39：數字、大寫英文、空白及 - . $ / + %；EAN-13 / UPC-A / EAN-8：純數字 (檢查碼可省略，自動補)；ITF：純數字 (奇數位數前面補 0)；Codabar：數字及 - $ : / . +。"));
+    barcodeHint_->setWordWrap(true);
+    bcf->addRow(barcodeHint_);
+    root->addWidget(barcodeGroup_);
+
     root->addStretch(1);
 
     // ---- 連線：使用者編輯 -> 模型 ----
@@ -928,6 +1013,28 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     connect(imageFocusYSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         editSelected([&](card::Element& e) { e.imageFocusY = v; });
         });
+    connect(barcodeValueEdit_, &QLineEdit::textEdited, this, [this](const QString& v) {
+        editSelected([&](card::Element& e) { e.barcodeValue = v; });
+        });
+    connect(barcodeSourceCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_) return;
+        editSelected([&](card::Element& e) { e.barcodeSource = i == 0 ? card::ImageSource::Fixed : card::ImageSource::Dynamic; });
+        if (ElementItem* it = selectedItem()) populatePanel(layout_.find(it->id()));
+        });
+    connect(barcodeTypeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_ || i < 0) return;
+        editSelected([&](card::Element& e) { e.barcodeType = static_cast<card::BarcodeType>(i); });
+        });
+    connect(qrEccCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
+        if (updating_ || i < 0) return;
+        editSelected([&](card::Element& e) { e.qrEcc = i; });
+        });
+    connect(barcodeFieldCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (updating_) return;
+        const QString field = barcodeFieldCombo_->currentText();
+        editSelected([&](card::Element& e) { e.barcodeField = field; });
+        });
+
     connect(fitCheck_, &QCheckBox::toggled, this, [this](bool on) {
         if (updating_) return;
         editSelected([&](card::Element& e) { e.fitContent = on; });      // 開啟時 editSelected 會立刻貼合
@@ -1115,7 +1222,7 @@ void DesignerWindow::addElement(card::ElementType type) {
         e.text = tr("新文字");
         e.xMm = 5; e.yMm = 5; e.wMm = 50; e.hMm = 8;
     }
-    else {
+    else if (type == card::ElementType::Image) {
         e.name = tr("圖片 %1").arg(count);
         e.xMm = 5; e.yMm = 5; e.wMm = 25; e.hMm = 25;
         QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));        // 沿用上次使用的資料夾 / 比對欄位
@@ -1127,6 +1234,22 @@ void DesignerWindow::addElement(card::ElementType type) {
         e.matchField = mf;
         e.imageFit = card::ImageFit::Cover;
     }
+    else if (type == card::ElementType::QRCode) {
+        e.name = tr("QR Code %1").arg(count);
+        e.barcodeSource = card::ImageSource::Dynamic;
+        e.qrEcc = 1;
+        const QStringList avail = currentFields();
+        e.barcodeField = avail.contains(QStringLiteral("學號")) ? QStringLiteral("學號") : (avail.isEmpty() ? QString() : avail.first());
+        e.xMm = 5; e.yMm = 5; e.wMm = 20; e.hMm = 20;
+    }
+    else {
+        e.name = tr("條碼 %1").arg(count);
+        e.barcodeSource = card::ImageSource::Dynamic;
+        e.barcodeType = card::BarcodeType::Code128;
+        const QStringList avail = currentFields();
+        e.barcodeField = avail.contains(QStringLiteral("學號")) ? QStringLiteral("學號") : (avail.isEmpty() ? QString() : avail.first());
+        e.xMm = 5; e.yMm = 5; e.wMm = 45; e.hMm = 14;
+    }
     layout_.elements.append(e);
     imagePool_.ensureAll(layout_);
     createItem(e.id, layout_.elements.size() - 1);
@@ -1134,6 +1257,35 @@ void DesignerWindow::addElement(card::ElementType type) {
 
     scene_->clearSelection();
     if (ElementItem* it = findItem(e.id)) it->setSelected(true);
+    commitUndo();
+}
+
+// 覆蓋順序：layout_.elements 的順序 = 疊放順序 (越後面越上層)，所以調整圖層就是移動它在清單中的位置。
+void DesignerWindow::moveLayer(int mode) {
+    ElementItem* it = selectedItem();
+    if (!it) return;
+    const QString id = it->id();
+    int from = -1;
+    for (int i = 0; i < layout_.elements.size(); ++i) if (layout_.elements[i].id == id) { from = i; break; }
+    if (from < 0) return;
+    const int last = layout_.elements.size() - 1;
+    int to = from;
+    switch (mode) {
+    case 0: to = last; break;
+    case 1: to = qMin(last, from + 1); break;
+    case 2: to = qMax(0, from - 1); break;
+    default: to = 0; break;
+    }
+    if (to == from) return;
+
+    commitUndo();
+    layout_.elements.move(from, to);
+    for (int i = 0; i < layout_.elements.size(); ++i)
+        if (ElementItem* e = findItem(layout_.elements[i].id)) e->setZValue(i);   // z 值 = 在清單中的順序
+    refreshList();
+    syncListSelection(id);
+    updateActionStates();
+    scene_->update();
     commitUndo();
 }
 
@@ -1459,6 +1611,7 @@ QStringList DesignerWindow::layoutFields() const {
             if (e.imageSource == card::ImageSource::Dynamic) add(e.matchField.trimmed());
             else addFrom(e.imagePath);
         }
+        else if ((e.type == card::ElementType::Barcode || e.type == card::ElementType::QRCode) && e.barcodeSource == card::ImageSource::Dynamic) add(e.barcodeField.trimmed());
     }
     return out;
 }
@@ -1501,6 +1654,14 @@ void DesignerWindow::rebuildFieldWidgets() {
         ElementItem* it = selectedItem();
         const card::Element* e = it ? layout_.find(it->id()) : nullptr;
         matchFieldCombo_->setCurrentIndex(e ? matchFieldCombo_->findText(e->matchField) : -1);   // 找不到 (-1) = 空白，請使用者選
+    }
+    if (barcodeFieldCombo_) {                                    // 條碼：動態資料欄位
+        QSignalBlocker b(barcodeFieldCombo_);
+        barcodeFieldCombo_->clear();
+        barcodeFieldCombo_->addItems(fields);
+        ElementItem* it = selectedItem();
+        const card::Element* e = it ? layout_.find(it->id()) : nullptr;
+        barcodeFieldCombo_->setCurrentIndex(e ? barcodeFieldCombo_->findText(e->barcodeField) : -1);
     }
     rebuildPreviewForm();                                        // 右側預覽資料
 
@@ -2174,6 +2335,7 @@ void DesignerWindow::populatePanel(const card::Element* e) {
 
         textGroup_->setVisible(e->type == card::ElementType::Text);
         imageGroup_->setVisible(e->type == card::ElementType::Image);
+        barcodeGroup_->setVisible(e->type == card::ElementType::Barcode || e->type == card::ElementType::QRCode);
 
         if (textEdit_->toPlainText() != e->text) textEdit_->setPlainText(e->text);
         fontCombo_->setCurrentFont(QFont(e->fontFamily));
@@ -2183,6 +2345,22 @@ void DesignerWindow::populatePanel(const card::Element* e) {
         alignCombo_->setCurrentIndex(static_cast<int>(e->align));
         updateColorButton(e->color);
 
+        if (e->type == card::ElementType::Barcode || e->type == card::ElementType::QRCode) {
+            const bool qr = e->type == card::ElementType::QRCode;
+            barcodeGroup_->setTitle(qr ? tr("QR Code") : tr("條碼"));
+            barcodeTypeBox_->setVisible(!qr);
+            barcodeHint_->setVisible(!qr);
+            qrEccBox_->setVisible(qr);
+            qrEccCombo_->setCurrentIndex(qBound(0, e->qrEcc, 3));
+            const bool dyn = e->barcodeSource == card::ImageSource::Dynamic;
+            barcodeSourceCombo_->setCurrentIndex(dyn ? 1 : 0);
+            barcodeTypeCombo_->setCurrentIndex(static_cast<int>(e->barcodeType));
+            barcodeFixedBox_->setVisible(!dyn);
+            barcodeDynamicBox_->setVisible(dyn);
+            barcodeValueEdit_->setText(e->barcodeValue);
+            int fi = barcodeFieldCombo_->findText(e->barcodeField);
+            barcodeFieldCombo_->setCurrentIndex(fi);
+        }
         if (e->type == card::ElementType::Image) {
             const bool dyn = e->imageSource == card::ImageSource::Dynamic;
             imageSourceCombo_->setCurrentIndex(dyn ? 1 : 0);
@@ -2206,6 +2384,7 @@ void DesignerWindow::populatePanel(const card::Element* e) {
         typeLabel_->clear();
         textGroup_->setVisible(false);
         imageGroup_->setVisible(false);
+        barcodeGroup_->setVisible(false);
     }
     updating_ = prev;
 }
@@ -2214,7 +2393,8 @@ void DesignerWindow::refreshList() {
     const bool prev = updating_;
     updating_ = true;
     elementList_->clear();
-    for (const auto& e : layout_.elements) {
+    for (int i = layout_.elements.size() - 1; i >= 0; --i) {      // 清單由上到下 = 最上層到最下層 (與卡面疊放順序一致)
+        const auto& e = layout_.elements[i];
         auto* li = new QListWidgetItem(listLabel(e));
         li->setData(Qt::UserRole, e.id);
         elementList_->addItem(li);

@@ -15,8 +15,13 @@ namespace card {
     constexpr double kCardShortMm = 53.98;
 
     enum class Orientation { Landscape, Portrait };
-    enum class ElementType { Text, Image };
+    enum class ElementType { Text, Image, Barcode, QRCode };
     enum class HAlign { Left = 0, Center = 1, Right = 2 };
+    // 條碼種類 (數值會存進版面檔的字串 key，順序可調整，但 key 不要改)
+    enum class BarcodeType { Code128 = 0, Code39, EAN13, EAN8, UPCA, ITF, Codabar };
+    const QStringList& barcodeTypeNames();                 // 下拉選單顯示名稱 (順序 = BarcodeType 數值)
+    QString barcodeTypeKey(BarcodeType t);                 // 版面檔用的 key
+    BarcodeType barcodeTypeFromKey(const QString& k);      // 找不到 = Code39 (相容舊版面檔)
 
     // ------------------------------------------------------------ 座標系 ---
     // 模型 (JSON 版面檔、渲染、鍍膜 Escape) 一律以「卡面左上角」為原點、Y 往下，單位 mm。
@@ -72,6 +77,16 @@ namespace card {
         // 貼合內容：文字框大小跟隨文字、圖片框高度跟隨圖片比例 (見 CardPainter.h 的 fitElement)。
         // 預設 false，所以舊版面檔不受影響。
         bool fitContent = false;
+
+        // 條碼：固定內容，或依每筆製卡資料指定欄位產生；barcodeType 為條碼種類。
+        BarcodeType barcodeType = BarcodeType::Code128;
+        // barcodeSource = Fixed 時使用 barcodeValue；Dynamic 時使用 barcodeField。
+        ImageSource barcodeSource = ImageSource::Fixed;
+        QString barcodeValue;             // 固定條碼內容
+        QString barcodeField;             // 動態條碼：對應 Excel / Record 欄位名稱
+        // QR Code (type == QRCode)：資料來源沿用 barcodeSource / barcodeValue / barcodeField，
+        // 另外多一個容錯等級 qrEcc：0 = L (7%)、1 = M (15%)、2 = Q (25%)、3 = H (30%)。
+        int qrEcc = 1;
 
         bool isDynamic() const;           // 內容是否含 {欄位}
         QJsonObject toJson() const;

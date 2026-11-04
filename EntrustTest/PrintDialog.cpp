@@ -99,7 +99,9 @@ PrintDialog::PrintDialog(const PrintInput& in, QWidget* parent) : QDialog(parent
     // 分析版面：用到哪些欄位、有沒有「自動比對圖片」的圖片元素
     for (const auto& e : in_.layout.elements) {
         const bool dynImage = e.type == card::ElementType::Image && e.imageSource == card::ImageSource::Dynamic;
-        const QString src = e.type == card::ElementType::Text ? e.text : (dynImage ? QString() : e.imagePath);
+        const bool dynBarcode = (e.type == card::ElementType::Barcode || e.type == card::ElementType::QRCode) && e.barcodeSource == card::ImageSource::Dynamic;
+        const QString src = e.type == card::ElementType::Text ? e.text : (dynImage || dynBarcode ? QString() : (e.type == card::ElementType::Image ? e.imagePath : QString()));
+        if (dynBarcode && !e.barcodeField.trimmed().isEmpty()) usedFields_.insert(e.barcodeField.trimmed());
         if (dynImage) {                                            // 每個動態圖片各自統計「比對欄位」的值有沒有重名
             hasAutoImage_ = true;
             QHash<QString, int>& cnt = matchValueCount_[e.id];
@@ -479,7 +481,12 @@ QStringList PrintDialog::problemsOf(int row) const {
         else if (!QFileInfo::exists(bgPath)) p << tr("找不到卡面底圖：%1").arg(bgPath);
     }
 
-    for (const auto& e : in_.layout.elements) {                       // 圖片：每個圖片元素各自檢查
+    for (const auto& e : in_.layout.elements) {
+        if (e.type == card::ElementType::Barcode || e.type == card::ElementType::QRCode) {
+            const QString err = card::checkCodeElement(e, rec);
+            if (!err.isEmpty()) p << tr("條碼「%1」無法產生：%2").arg(e.name, err);
+            continue;
+        }
         if (e.type != card::ElementType::Image) continue;
         const QString who = tr("圖片「%1」").arg(e.name);
         if (e.imageSource == card::ImageSource::Fixed) {              // 固定圖片
@@ -906,6 +913,12 @@ QString PrintDialog::settingsSummary() const {
     if (!in_.layout.background.isEmpty())
         l << tr("卡面底圖：%1 (%2)").arg(in_.layout.background.path, in_.layout.background.print ? tr("印出") : tr("不印出"));
     for (const auto& e : in_.layout.elements) {
+        if (e.type == card::ElementType::Barcode || e.type == card::ElementType::QRCode) {
+            l << tr("條碼「%1」：%2，%3").arg(e.name,
+                e.type == card::ElementType::QRCode ? QStringLiteral("QR Code") : card::barcodeTypeNames().value(static_cast<int>(e.barcodeType)),
+                e.barcodeSource == card::ImageSource::Fixed ? tr("固定 %1").arg(e.barcodeValue) : tr("動態欄位 %1").arg(e.barcodeField));
+            continue;
+        }
         if (e.type != card::ElementType::Image) continue;
         if (e.imageSource == card::ImageSource::Fixed)
             l << tr("圖片「%1」：固定 %2").arg(e.name, e.imagePath.isEmpty() ? tr("(未指定)") : e.imagePath);

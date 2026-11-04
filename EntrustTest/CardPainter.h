@@ -16,6 +16,10 @@ namespace card {
 	//   設計畫面：showInDesigner 時畫；renderCard (預覽輸出 / 列印)：print 為 true 時才畫。
 	void paintBackground(QPainter& p, const CardBackground& bg, const QRectF& rectPx, double pxPerMm, const Record& rec);
 
+	// 檢查條碼 / QR Code 元素用這一筆資料能不能產生 (內容為空、含不支援字元、檢查碼錯誤、太長...)。
+	// 回傳空字串 = 可以；否則是原因。其他類型的元素一律回傳空字串。列印前檢查用。
+	QString checkCodeElement(const Element& e, const Record& rec);
+
 	// 把整張卡渲染成影像 (dpi 例如 300 / 600)。階段 3 列印時會用它。
 	QImage renderCard(const CardLayout& layout, const Record& rec, int dpi);
 

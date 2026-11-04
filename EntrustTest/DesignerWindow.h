@@ -87,6 +87,7 @@ private:
     // 動作
     void addElement(card::ElementType type);
     void deleteSelected();
+    void moveLayer(int mode);              // 圖層順序：0 = 移到最上層、1 = 上移一層、2 = 下移一層、3 = 移到最下層
     void openLayout();
     void saveLayout();
     void exportPreview();
@@ -183,6 +184,7 @@ private:
     QAction* actUndo_ = nullptr;
     QAction* actRedo_ = nullptr;
     QAction* actDelete_ = nullptr;
+    QAction* actLayer_[4] = { nullptr, nullptr, nullptr, nullptr };   // 移到最上層 / 上移一層 / 下移一層 / 移到最下層
     QAction* actPrevRecord_ = nullptr;
     QAction* actNextRecord_ = nullptr;
     QAction* actLandscape_ = nullptr;
@@ -224,6 +226,19 @@ private:
     QDoubleSpinBox* imageZoomSpin_ = nullptr;
     QDoubleSpinBox* imageFocusXSpin_ = nullptr;
     QDoubleSpinBox* imageFocusYSpin_ = nullptr;
+
+    // 條碼 (Code 39)：固定輸入內容 / 動態指定 Excel 欄位
+    QGroupBox* barcodeGroup_ = nullptr;
+    QComboBox* barcodeSourceCombo_ = nullptr;
+    QComboBox* barcodeTypeCombo_ = nullptr;
+    QWidget* barcodeTypeBox_ = nullptr;
+    QWidget* qrEccBox_ = nullptr;
+    QComboBox* qrEccCombo_ = nullptr;
+    QLabel* barcodeHint_ = nullptr;
+    QWidget* barcodeFixedBox_ = nullptr;
+    QWidget* barcodeDynamicBox_ = nullptr;
+    QLineEdit* barcodeValueEdit_ = nullptr;
+    QComboBox* barcodeFieldCombo_ = nullptr;
 
     // 鍍膜面板
     QComboBox* topBaseCombo_ = nullptr;
