@@ -16,6 +16,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDockWidget>
+#include <QDropEvent>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -54,6 +55,7 @@
 #include <QShowEvent>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
 #include <QVBoxLayout>
@@ -188,6 +190,17 @@ namespace {
         const card::Record* rec_;
     };
 
+    // 元素清單：可用滑鼠拖曳項目調整圖層順序 (拖放完成後通知視窗依清單順序更新)
+    class ElementListWidget : public QListWidget {
+    public:
+        std::function<void()> onReordered;
+    protected:
+        void dropEvent(QDropEvent* e) override {
+            QListWidget::dropEvent(e);
+            if (onReordered) onReordered();
+        }
+    };
+
     QString typeText(const card::Element& e) {
         if (e.type == card::ElementType::Text) return QStringLiteral("文字");
         if (e.type == card::ElementType::Image) return QStringLiteral("圖片");
@@ -205,7 +218,11 @@ namespace {
         const QString& tip, std::function<void()> fn) {
         auto* a = new QAction(text, parent);
         if (!key.isEmpty()) a->setShortcut(key);
-        if (!tip.isEmpty()) a->setToolTip(tip);
+        QString t = tip;
+        // 提示文字沒有自己寫快捷鍵 (含括號) 時自動補上，滑過按鈕就知道快捷鍵
+        if (!t.isEmpty() && !key.isEmpty() && !t.contains(QLatin1Char('(')))
+            t += QStringLiteral(" (%1)").arg(key.toString(QKeySequence::NativeText));
+        if (!t.isEmpty()) a->setToolTip(t);
         if (fn) QObject::connect(a, &QAction::triggered, parent, [fn] { fn(); });
         return a;
     }
@@ -258,6 +275,8 @@ DesignerWindow::DesignerWindow(QWidget* parent) : QMainWindow(parent) {
     applyPreviewRecord();
     rebuildScene();
     baseline_ = layout_;                   // 復原的起點 = 剛建好的預設版面
+    savedJson_ = layout_.toJson();         // 「有沒有未儲存的修改」的比較基準
+    updateWindowTitle();
     updateUndoActions();
 
     // 介面大小改變時 (選單 / 快捷鍵) 更新介面
@@ -281,6 +300,10 @@ DesignerWindow::~DesignerWindow() {
 }
 
 void DesignerWindow::closeEvent(QCloseEvent* ev) {
+    if (!maybeSave()) {                    // 有未儲存的修改，而且使用者按了「取消」
+        ev->ignore();
+        return;
+    }
     QSettings st(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner"));
     st.setValue(QStringLiteral("window/geometry"), saveGeometry());
     st.setValue(QStringLiteral("window/state"), saveState(kWindowStateVersion));
@@ -347,8 +370,39 @@ void DesignerWindow::buildUi() {
     // ---- 面板 (都放進 QDockWidget，可由「檢視」選單重新開啟) ----
     elementDock_ = new QDockWidget(tr("元素清單 (上方 = 最上層)"), this);
     elementDock_->setObjectName(QStringLiteral("dockElements"));
-    elementList_ = new QListWidget;
-    elementDock_->setWidget(elementList_);
+    {
+        auto* list = new ElementListWidget;
+        elementList_ = list;
+        list->setDragDropMode(QAbstractItemView::InternalMove);       // 拖曳項目 = 調整圖層順序
+        list->setDefaultDropAction(Qt::MoveAction);
+        list->setDragEnabled(true);
+        list->setToolTip(tr("拖曳項目，或按右邊的 ▲ ▼，可調整元素的覆蓋順序 (清單最上面 = 蓋在最上層)"));
+        list->onReordered = [this] { QTimer::singleShot(0, this, [this] { reorderFromList(); }); };
+
+        layerUpBtn_ = new QToolButton;
+        layerUpBtn_->setText(QStringLiteral("▲"));
+        layerUpBtn_->setToolTip(tr("上移一層：往清單上方移動，蓋住更多元素 (Ctrl+])"));
+        layerDownBtn_ = new QToolButton;
+        layerDownBtn_->setText(QStringLiteral("▼"));
+        layerDownBtn_->setToolTip(tr("下移一層：往清單下方移動，被其他元素蓋住 (Ctrl+[)"));
+        layerUpBtn_->setEnabled(false);
+        layerDownBtn_->setEnabled(false);
+        connect(layerUpBtn_, &QToolButton::clicked, this, [this] { moveLayer(1); });
+        connect(layerDownBtn_, &QToolButton::clicked, this, [this] { moveLayer(2); });
+
+        auto* box = new QWidget;
+        auto* hl = new QHBoxLayout(box);
+        hl->setContentsMargins(0, 0, 0, 0);
+        hl->setSpacing(uiscale::px(4));
+        hl->addWidget(list, 1);
+        auto* col = new QVBoxLayout;
+        col->addStretch(1);
+        col->addWidget(layerUpBtn_);
+        col->addWidget(layerDownBtn_);
+        col->addStretch(1);
+        hl->addLayout(col);
+        elementDock_->setWidget(box);
+    }
     connect(elementList_, &QListWidget::currentRowChanged, this, [this](int row) {
         if (updating_ || row < 0) return;
         const QString id = elementList_->item(row)->data(Qt::UserRole).toString();
@@ -412,7 +466,12 @@ void DesignerWindow::buildUi() {
     statusBar()->addPermanentWidget(cursorLabel_);
     updateCursorLabel(QPointF(), false);
 
-    statusBar()->showMessage(tr("Ctrl+滾輪縮放；拖曳元素移動；選取後拖曳右下角方塊調整大小；Delete 刪除；Ctrl+Z 復原；拖曳時會自動對齊 (按住 Alt 暫時停用)，Shift+拖曳角落等比例縮放"));
+    // 左側：隨選取狀態改變的操作提示 (其他訊息出現時會暫時蓋住它，幾秒後自動回來)
+    hintLabel_ = new QLabel;
+    hintLabel_->setStyleSheet(QStringLiteral("color:#555; padding:0 6px;"));
+    hintLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);   // 文字太長時截斷，不會把視窗撐大
+    statusBar()->addWidget(hintLabel_, 1);
+    updateHints();
 
     applyUiScale();                        // 依目前「介面大小」設定尺寸 (尺規、最小寬度、工具列…)
 }
@@ -445,8 +504,9 @@ void DesignerWindow::applyDockSizes() {
 // ---- 選單列 + 精簡工具列 ----
 void DesignerWindow::buildMenus() {
     // 動作
-    auto* actOpenLayout = newAction(this, tr("開啟版面"), QKeySequence::Open, tr("開啟已儲存的版面檔 (.json)"), [this] { openLayout(); });
-    auto* actSaveLayout = newAction(this, tr("儲存版面"), QKeySequence::Save, tr("把目前的版面存成 .json"), [this] { saveLayout(); });
+    auto* actOpenLayout = newAction(this, tr("開啟版面"), QKeySequence::Open, tr("開啟已儲存的版面檔 (Ctrl+O)"), [this] { openLayout(); });
+    auto* actSaveLayout = newAction(this, tr("儲存版面"), QKeySequence::Save, tr("儲存目前的版面；第一次儲存會詢問檔名 (Ctrl+S)"), [this] { saveLayout(); });
+    actSaveAs_ = newAction(this, tr("另存版面…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S), tr("把目前的版面另存成新檔 (Ctrl+Shift+S)"), [this] { saveLayoutAs(); });
     auto* actExport = newAction(this, tr("輸出預覽圖 (300dpi)…"), QKeySequence(Qt::CTRL | Qt::Key_E), tr("把目前預覽的卡面輸出成 PNG"), [this] { exportPreview(); });
     auto* actQuit = newAction(this, tr("結束"), QKeySequence::Quit, QString(), [this] { close(); });
 
@@ -490,6 +550,7 @@ void DesignerWindow::buildMenus() {
     QMenu* mFile = menuBar()->addMenu(tr("檔案(&F)"));
     mFile->addAction(actOpenLayout);
     mFile->addAction(actSaveLayout);
+    mFile->addAction(actSaveAs_);
     mFile->addSeparator();
     mFile->addAction(actLoadData);
     mFile->addSeparator();
@@ -566,6 +627,7 @@ void DesignerWindow::buildMenus() {
             regionEditCheck_->setChecked(on);
         }
         refreshRegionItemsView();
+        updateHints();
         });
     mView->addAction(actRegionEdit_);
     actSnap_ = newAction(this, tr("對齊輔助線"), QKeySequence(), tr("拖曳 / 縮放時自動貼齊其他元素與卡面的邊、中心線 (拖曳時按住 Alt 可暫時停用)"), nullptr);
@@ -607,6 +669,10 @@ void DesignerWindow::buildMenus() {
     mView->addAction(actFitWindow);
     auto* actFull = newAction(this, tr("全螢幕"), QKeySequence(Qt::Key_F11), tr("切換全螢幕 (F11)"), [this] { if (isFullScreen()) showNormal(); else showFullScreen(); });
     mView->addAction(actFull);
+
+    auto* actHelp = newAction(this, tr("操作說明"), QKeySequence(Qt::Key_F1), tr("基本流程、卡面操作與快捷鍵一覽"), [this] { showHelp(); });
+    QMenu* mHelp = menuBar()->addMenu(tr("說明(&H)"));
+    mHelp->addAction(actHelp);
 
     // 工具列：依「使用流程」分成兩排
     //   第 1 排 (檔案 / 資料 / 列印)：開啟 → 載入資料 → ……… → 列印 (靠右、醒目)
@@ -656,9 +722,7 @@ void DesignerWindow::buildMenus() {
     tb2->addAction(actAddBarcode);   // 新增條碼按鈕：放在「元素」工具列，與文字、圖片並列
     tb2->addAction(actDelete_);
     tb2->addSeparator();
-    tb2->addWidget(caption(tr("層次")));
-    for (int k = 0; k < 4; ++k) tb2->addAction(actLayer_[k]);
-    tb2->addSeparator();
+    // 圖層順序不放在工具列：請用「元素清單」旁的 ▲ ▼ 或直接拖曳清單項目 (編輯選單 / 快捷鍵仍可用)
     tb2->addWidget(caption(tr("檢視")));
     tb2->addAction(actFit);
     tb2->addSeparator();
@@ -667,6 +731,7 @@ void DesignerWindow::buildMenus() {
     recordLabel_ = new QLabel;
     recordLabel_->setMinimumWidth(uiscale::px(110));
     recordLabel_->setAlignment(Qt::AlignCenter);
+    recordLabel_->setToolTip(tr("目前預覽的是第幾筆資料。載入 Excel 後，也可以直接在左側資料表點選。"));
     tb2->addWidget(recordLabel_);
     tb2->addAction(actNextRecord_);
     addToolBar(Qt::TopToolBarArea, tb2);
@@ -678,7 +743,7 @@ void DesignerWindow::buildMenus() {
 void DesignerWindow::updateRecordLabel() {
     if (!recordLabel_) return;
     if (data_.rows.isEmpty()) {
-        recordLabel_->setText(tr("(範例資料)"));
+        recordLabel_->setText(tr("尚未載入資料"));
         return;
     }
     const int row = dataTable_ ? dataTable_->currentRow() : -1;
@@ -696,6 +761,8 @@ void DesignerWindow::updateActionStates() {
         if (actLayer_[1]) actLayer_[1]->setEnabled(idx >= 0 && idx < last);
         if (actLayer_[2]) actLayer_[2]->setEnabled(idx > 0);
         if (actLayer_[3]) actLayer_[3]->setEnabled(idx > 0);
+        if (layerUpBtn_) layerUpBtn_->setEnabled(idx >= 0 && idx < last);
+        if (layerDownBtn_) layerDownBtn_->setEnabled(idx > 0);
     }
     if (actDelete_) actDelete_->setEnabled(selectedItem() != nullptr || selectedRegion() != nullptr || !currentRegionId().isEmpty());
     const bool hasData = !data_.rows.isEmpty();
@@ -718,13 +785,13 @@ QWidget* DesignerWindow::buildPropertyPanel() {
     hSpin_ = makeMmSpin(1, 300);
     basic->addRow(tr("名稱"), nameEdit_);
     basic->addRow(tr("類型"), typeLabel_);
-    basic->addRow(tr("X"), xSpin_);
-    basic->addRow(tr("Y"), ySpin_);
+    basic->addRow(tr("X 位置"), xSpin_);
+    basic->addRow(tr("Y 位置"), ySpin_);
     xSpin_->setToolTip(tr("元素左下角到卡面左邊的距離 (原點 = 卡面左下角)"));
     ySpin_->setToolTip(tr("元素左下角到卡面底邊的距離，往上增加 (原點 = 卡面左下角)"));
     hSpin_->setToolTip(tr("修改高度時，元素的底邊位置不變，往上長高 / 縮短"));
-    basic->addRow(tr("寬"), wSpin_);
-    basic->addRow(tr("高"), hSpin_);
+    basic->addRow(tr("寬度"), wSpin_);
+    basic->addRow(tr("高度"), hSpin_);
     fitCheck_ = new QCheckBox;
     fitCheck_->setToolTip(tr("文字：框的寬、高自動等於文字的實際大小 (不換行)，X / Y 即為文字的位置。\n"
         "圖片：寬度不變，高度依圖片長寬比自動調整 (底邊不動，往上長高)。\n"
@@ -1056,14 +1123,36 @@ QWidget* DesignerWindow::buildPropertyPanel() {
         if (ElementItem* it = selectedItem()) populatePanel(layout_.find(it->id()));   // 更新數字與寬 / 高欄位的啟用狀態
         });
 
+    // 尚未選取元素時，不顯示一堆灰掉的欄位，改顯示說明
+    propHint_ = new QLabel(tr("尚未選取元素\n\n"
+        "• 在卡面上點一下要編輯的元素\n"
+        "• 或在上方「元素清單」選取\n"
+        "• 還沒有元素？用工具列的「新增文字 / 圖片 / QR Code / 條碼」加入\n\n"
+        "選取後，這裡會出現該元素的位置、大小與內容設定。"));
+    propHint_->setWordWrap(true);
+    propHint_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    propHint_->setStyleSheet(QStringLiteral("color:#666; padding:%1px;").arg(uiscale::px(10)));
+
+    auto* outer = new QWidget;
+    auto* ol = new QVBoxLayout(outer);
+    ol->setContentsMargins(0, 0, 0, 0);
+    ol->addWidget(propHint_);
+    ol->addWidget(propertyPanel_, 1);
+
     populatePanel(nullptr);
-    return propertyPanel_;
+    return outer;
 }
 
 QWidget* DesignerWindow::buildPreviewPanel() {
     // 放在右側面板，所以欄位由上往下排
     auto* w = new QWidget;
     auto* v = new QVBoxLayout(w);
+
+    auto* previewHint = new QLabel(tr("這裡是卡面預覽用的內容，不會改到 Excel。\n"
+        "載入 Excel 後，在左側點選一筆就會自動帶入；也可以手動改來試排版。"));
+    previewHint->setWordWrap(true);
+    previewHint->setStyleSheet(QStringLiteral("color:#666;"));
+    v->addWidget(previewHint);
 
     usePreviewCheck_ = new QCheckBox(tr("以此資料預覽"));
     usePreviewCheck_->setToolTip(tr("取消勾選時，動態欄位 {欄位名稱} 等會直接顯示原樣"));
@@ -1086,7 +1175,7 @@ QWidget* DesignerWindow::buildDataPanel() {
 
     auto* top = new QHBoxLayout;
     auto* loadBtn = new QPushButton(tr("載入 Excel…"));
-    dataInfo_ = new QLabel(tr("尚未載入資料\n載入 Excel 後，所有欄位都可以用在文字與圖片"));
+    dataInfo_ = new QLabel(tr("尚未載入資料"));
     dataInfo_->setWordWrap(true);
     top->addWidget(loadBtn);
     top->addWidget(dataInfo_, 1);
@@ -1097,6 +1186,16 @@ QWidget* DesignerWindow::buildDataPanel() {
     dataFilter_->setPlaceholderText(tr("搜尋 (任一欄位)"));
     dataFilter_->setClearButtonEnabled(true);
     v->addWidget(dataFilter_);
+
+    dataEmptyLabel_ = new QLabel(tr("尚未載入製卡資料\n\n"
+        "按上方「載入 Excel…」選擇 .xlsx 檔。\n"
+        "載入後點選任一筆，卡面就會顯示該筆資料；\n"
+        "Excel 的所有欄位都能用在文字、圖片與條碼。\n\n"
+        "還沒有資料也沒關係：\n可以先在右側「預覽資料」輸入範例內容來排版。"));
+    dataEmptyLabel_->setAlignment(Qt::AlignCenter);
+    dataEmptyLabel_->setWordWrap(true);
+    dataEmptyLabel_->setStyleSheet(QStringLiteral("color:#666;"));
+    v->addWidget(dataEmptyLabel_, 1);
 
     const QStringList& fields = card::fieldNames();
     dataTable_ = new QTableWidget(0, fields.size() + 1);          // 最後一欄是「圖片」比對結果
@@ -1118,6 +1217,7 @@ QWidget* DesignerWindow::buildDataPanel() {
         });
 
     refreshImageMatches();
+    updateDataEmptyState();
     return w;
 }
 
@@ -1305,6 +1405,37 @@ void DesignerWindow::moveLayer(int mode) {
     commitUndo();
 }
 
+// 清單由上到下 = 最上層到最下層；拖曳完成後，依清單順序重排 layout_.elements (越後面越上層)
+void DesignerWindow::reorderFromList() {
+    QStringList ids;
+    for (int i = elementList_->count() - 1; i >= 0; --i)           // 反過來 = 由下到上
+        ids << elementList_->item(i)->data(Qt::UserRole).toString();
+    if (ids.size() != layout_.elements.size()) { refreshList(); return; }
+    bool same = true;
+    for (int i = 0; i < ids.size(); ++i) if (layout_.elements[i].id != ids[i]) { same = false; break; }
+    if (same) return;
+
+    QString selId;
+    if (ElementItem* it = selectedItem()) selId = it->id();
+
+    commitUndo();
+    decltype(layout_.elements) reordered;
+    for (const QString& id : ids) {
+        const card::Element* e = layout_.find(id);
+        if (!e) { refreshList(); return; }
+        reordered.append(*e);
+    }
+    layout_.elements = reordered;
+    for (int i = 0; i < layout_.elements.size(); ++i)
+        if (ElementItem* e = findItem(layout_.elements[i].id)) e->setZValue(i);
+    refreshList();
+    if (!selId.isEmpty()) syncListSelection(selId);
+    updateActionStates();
+    scene_->update();
+    commitUndo();
+    statusBar()->showMessage(tr("已調整圖層順序"), 3000);
+}
+
 void DesignerWindow::deleteSelected() {
     // 焦點在「鍍膜範圍」清單，或選取的是鍍膜範圍 (沒有選元素)：刪除範圍
     if (regionList_->hasFocus() || (!selectedItem() && selectedRegion())) {
@@ -1338,7 +1469,8 @@ void DesignerWindow::setOrientation(card::Orientation o) {
 }
 
 void DesignerWindow::openLayout() {
-    const QString path = QFileDialog::getOpenFileName(this, tr("開啟版面"), QString(), tr("版面檔 (*.json)"));
+    const QString startDir = QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner")).value(QStringLiteral("lastLayoutDir")).toString();
+    const QString path = QFileDialog::getOpenFileName(this, tr("開啟版面"), startDir, tr("版面檔 (*.json)"));
     if (path.isEmpty()) return;
     card::CardLayout loaded;
     QString err;
@@ -1351,19 +1483,140 @@ void DesignerWindow::openLayout() {
     layout_ = loaded;
     rebuildScene();
     commitUndo();                          // 開啟版面也可以用 Ctrl+Z 退回開啟前
-    statusBar()->showMessage(tr("已開啟 %1").arg(path), 5000);
+    layoutPath_ = path;
+    savedJson_ = layout_.toJson();         // 剛開啟 = 沒有未儲存的修改
+    QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner")).setValue(QStringLiteral("lastLayoutDir"), QFileInfo(path).absolutePath());
+    updateWindowTitle();
+    statusBar()->showMessage(tr("已開啟 %1").arg(QDir::toNativeSeparators(path)), 5000);
 }
 
-void DesignerWindow::saveLayout() {
-    QString path = QFileDialog::getSaveFileName(this, tr("儲存版面"), QStringLiteral("layout.json"), tr("版面檔 (*.json)"));
-    if (path.isEmpty()) return;
+bool DesignerWindow::saveLayout() {
+    if (layoutPath_.isEmpty()) return saveLayoutAs();     // 還沒有檔名：問一次
+    return writeLayout(layoutPath_);                      // 已有檔名：直接存，不再跳視窗
+}
+
+bool DesignerWindow::saveLayoutAs() {
+    const QString dir = QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner")).value(QStringLiteral("lastLayoutDir")).toString();
+    const QString start = !layoutPath_.isEmpty() ? layoutPath_
+        : (dir.isEmpty() ? QStringLiteral("layout.json") : QDir(dir).filePath(QStringLiteral("layout.json")));
+    QString path = QFileDialog::getSaveFileName(this, tr("另存版面"), start, tr("版面檔 (*.json)"));
+    if (path.isEmpty()) return false;
     if (QFileInfo(path).suffix().isEmpty()) path += QStringLiteral(".json");
+    return writeLayout(path);
+}
+
+bool DesignerWindow::writeLayout(const QString& path) {
+    commitUndo();
     QString err;
     if (!layout_.saveToFile(path, &err)) {
         QMessageBox::warning(this, tr("儲存失敗"), err);
-        return;
+        return false;
     }
-    statusBar()->showMessage(tr("已儲存 %1").arg(path), 5000);
+    layoutPath_ = path;
+    savedJson_ = layout_.toJson();
+    QSettings(QStringLiteral("EntrustTest"), QStringLiteral("CardDesigner")).setValue(QStringLiteral("lastLayoutDir"), QFileInfo(path).absolutePath());
+    updateWindowTitle();
+    statusBar()->showMessage(tr("已儲存 %1").arg(QDir::toNativeSeparators(path)), 5000);
+    return true;
+}
+
+bool DesignerWindow::isDirty() const {
+    return layout_.toJson() != savedJson_;
+}
+
+void DesignerWindow::updateWindowTitle() {
+    const QString name = layoutPath_.isEmpty() ? tr("未命名版面") : QFileInfo(layoutPath_).fileName();
+    setWindowTitle(QStringLiteral("%1[*] - Entrust Card Tool").arg(name));     // [*] 由 setWindowModified 決定要不要顯示 *
+    setWindowModified(isDirty());
+}
+
+// 關閉前：版面有改動就先問。回傳 false = 使用者按了「取消」(或存檔失敗)，不要關閉。
+bool DesignerWindow::maybeSave() {
+    commitUndo();
+    if (!isDirty()) return true;
+    const QString name = layoutPath_.isEmpty() ? tr("未命名版面") : QFileInfo(layoutPath_).fileName();
+    QMessageBox box(QMessageBox::Question, tr("尚未儲存"),
+        tr("「%1」有尚未儲存的修改。\n要先儲存再離開嗎？").arg(name), QMessageBox::NoButton, this);
+    QPushButton* saveBtn = box.addButton(tr("儲存"), QMessageBox::AcceptRole);
+    QPushButton* discardBtn = box.addButton(tr("不儲存"), QMessageBox::DestructiveRole);
+    box.addButton(tr("取消"), QMessageBox::RejectRole);
+    box.setDefaultButton(saveBtn);
+    box.exec();
+    if (box.clickedButton() == saveBtn) return saveLayout();
+    return box.clickedButton() == discardBtn;                 // 取消 / 按 X / Esc -> false
+}
+
+// 狀態列左側：依目前狀態，告訴使用者「現在可以做什麼」
+void DesignerWindow::updateHints() {
+    if (!hintLabel_) return;
+    QString s;
+    if (actRegionEdit_ && actRegionEdit_->isChecked()) {
+        s = tr("編輯鍍膜範圍中：拖曳範圍移動、拖右下角方塊調整大小；點選卡面上的元素即可回到一般設計");
+    }
+    else if (ElementItem* it = selectedItem()) {
+        const card::Element* e = layout_.find(it->id());
+        s = tr("已選取「%1」：拖曳移動、拖右下角方塊調整大小 (Shift 等比例)、Delete 刪除；精確數值在右側「屬性」輸入")
+            .arg(e ? e->name : QString());
+    }
+    else {
+        s = tr("點選卡面上的元素即可編輯，或用工具列「新增文字 / 圖片…」加入元素；Ctrl+滾輪縮放卡面；F1 = 操作說明");
+    }
+    hintLabel_->setText(s);
+    hintLabel_->setToolTip(s);
+}
+
+void DesignerWindow::updateDataEmptyState() {
+    if (!dataEmptyLabel_) return;
+    const bool empty = data_.rows.isEmpty() && data_.path.isEmpty();
+    dataEmptyLabel_->setVisible(empty);
+    if (dataFilter_) dataFilter_->setVisible(!empty);
+    if (dataTable_) dataTable_->setVisible(!empty);
+}
+
+void DesignerWindow::showHelp() {
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("操作說明"));
+    auto* v = new QVBoxLayout(&dlg);
+    auto* tb = new QTextBrowser;
+    tb->setOpenLinks(false);
+    QString html;
+    html += tr("<h3>基本流程</h3><ol>"
+        "<li><b>載入製卡資料</b>：工具列「載入 Excel 資料」，選 .xlsx 並確認標題列。</li>"
+        "<li><b>設計卡面</b>：用「新增文字 / 圖片 / QR Code / 條碼」加入元素，在右側「屬性」設定內容。"
+        "文字可用 {欄位名稱} 帶入 Excel 資料；圖片選「動態圖片」會依資料欄位自動找檔案。</li>"
+        "<li><b>預覽</b>：在左側資料表點選一筆，卡面立刻顯示該筆；也可用工具列「上一筆 / 下一筆」。</li>"
+        "<li><b>儲存版面</b>：存成 .json，下次用「開啟版面」直接載入。標題列出現 * 表示有尚未儲存的修改。</li>"
+        "<li><b>列印</b>：工具列最右邊綠色「列印…」。可印目前這一筆、指定範圍或自訂清單；"
+        "建議先勾「測試模式」輸出 PNG 檢查版面。</li></ol>");
+    html += tr("<h3>卡面操作</h3><ul>"
+        "<li>拖曳元素移動；選取後拖右下角方塊調整大小；Shift + 拖曳角落 = 等比例縮放。</li>"
+        "<li>拖曳時會自動對齊其他元素與卡面邊緣，按住 Alt 可暫時停用。</li>"
+        "<li>Ctrl + 滾輪縮放卡面；「符合視窗」讓整張卡剛好放進視窗。</li>"
+        "<li>座標與尺規的原點在<b>卡面左下角</b>：X 往右增加、Y 往上增加，單位 mm。</li>"
+        "<li>元素重疊時，在右上角「元素清單」拖曳項目，或按清單旁的 ▲ ▼，決定誰蓋在誰上面；清單最上面 = 最上層。</li>"
+        "<li>誤操作可用復原 (Ctrl+Z)；重做 Ctrl+Y。</li></ul>");
+    html += tr("<h3>快捷鍵</h3><table cellpadding='3'>"
+        "<tr><td>Ctrl+O / Ctrl+S / Ctrl+Shift+S</td><td>開啟 / 儲存 / 另存版面</td></tr>"
+        "<tr><td>Ctrl+Shift+O</td><td>載入 Excel 資料</td></tr>"
+        "<tr><td>Ctrl+P</td><td>列印</td></tr>"
+        "<tr><td>Ctrl+E</td><td>輸出預覽圖 (PNG)</td></tr>"
+        "<tr><td>Ctrl+T / Ctrl+I</td><td>新增文字 / 圖片</td></tr>"
+        "<tr><td>Ctrl+Shift+R / Ctrl+Shift+B</td><td>新增 QR Code / 條碼</td></tr>"
+        "<tr><td>Delete 或 Backspace</td><td>刪除選取的元素 (焦點在卡面或清單時)</td></tr>"
+        "<tr><td>Ctrl+] / Ctrl+[</td><td>上移 / 下移一層 (加 Shift = 最上 / 最下層)</td></tr>"
+        "<tr><td>Alt+← / Alt+→</td><td>預覽上一筆 / 下一筆資料</td></tr>"
+        "<tr><td>Ctrl+0</td><td>卡面符合視窗</td></tr>"
+        "<tr><td>Ctrl+Shift++ / Ctrl+Shift+-</td><td>放大 / 縮小介面</td></tr>"
+        "<tr><td>F11</td><td>全螢幕</td></tr>"
+        "<tr><td>F1</td><td>開啟這份說明</td></tr></table>");
+    html += tr("<h3>找不到面板？</h3><p>到「檢視 → 面板」重新開啟；版面亂掉時用「檢視 → 還原預設面板配置」或「視窗適應螢幕」。</p>");
+    tb->setHtml(html);
+    v->addWidget(tb, 1);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Close);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    v->addWidget(bb);
+    uiscale::fitSize(&dlg, 660, 680);
+    dlg.exec();
 }
 
 void DesignerWindow::exportPreview() {
@@ -1755,6 +2008,7 @@ bool DesignerWindow::loadData(const QString& path) {
 
     refreshImageMatches();
     updateDataInfo();
+    updateDataEmptyState();
     updateActionStates();
     updateRecordLabel();
     dataDock_->show();
@@ -2009,7 +2263,7 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
     auto* root = new QVBoxLayout(w);
 
     // --- 基本設定：PrintTicket ---
-    auto* baseBox = new QGroupBox(tr("基本設定 (PrintTicket)"));
+    auto* baseBox = new QGroupBox(tr("鍍膜基本設定 (PrintTicket)"));
     auto* bf = new QFormLayout(baseBox);
     topBaseCombo_ = new QComboBox;
     topBaseCombo_->addItems({ tr("沿用驅動程式設定"), tr("全卡鍍膜"), tr("全卡鍍膜，但避開…"), tr("完全不鍍膜") });   // 順序 = card::TopcoatBase 的值
@@ -2020,13 +2274,16 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
     root->addWidget(baseBox);
 
     // --- 額外範圍：Escape ---
-    auto* regBox = new QGroupBox(tr("額外範圍 (Escape)"));
+    auto* regBox = new QGroupBox(tr("鍍膜額外範圍 (Escape)"));
     auto* rl = new QVBoxLayout(regBox);
-    auto* hint = new QLabel(tr("鍍膜區：只在範圍內鍍膜 (其餘不鍍)\n移除鍍膜：範圍內不鍍膜\n列印阻擋：範圍內不列印\n"
-        "選「完全不鍍膜」時，鍍膜區 / 移除鍍膜會被忽略 (只有列印阻擋有效)。\n"
-        "範圍可在卡面上拖曳，選取後拖右下角方塊調整大小 (座標以卡面左上角為原點，單位 mm)。\n"
-        "平常 (「編輯鍍膜範圍」未勾選) 範圍只畫虛線外框、不接受滑鼠，不會擋到卡面設計。\n"
-        "要調整範圍：按「新增範圍」，或在下方清單選取範圍，會自動進入編輯模式 (此時元素暫時不接受滑鼠)；選取元素後會自動離開。"));
+    auto* hint = new QLabel(tr("三種範圍：\n"
+        "• 鍍膜區：只在範圍內鍍膜 (範圍外不鍍)\n"
+        "• 移除鍍膜：範圍內不鍍膜\n"
+        "• 列印阻擋：範圍內不列印\n"
+        "上方基本設定選「完全不鍍膜」時，鍍膜區與移除鍍膜會被忽略，只有列印阻擋有效。\n\n"
+        "怎麼調整：按「新增範圍」或在下方清單選取，會自動進入編輯模式，之後在卡面拖曳移動、"
+        "拖右下角方塊調整大小 (座標以卡面左下角為原點，單位 mm)。\n"
+        "點選卡面上的元素就會離開編輯模式，回到一般設計。"));
     hint->setWordWrap(true);
     hint->setStyleSheet(QStringLiteral("color:#666;"));
     rl->addWidget(hint);
@@ -2058,10 +2315,10 @@ QWidget* DesignerWindow::buildTopcoatPanel() {
     rwSpin_ = makeMmSpin(0.5, 300);
     rhSpin_ = makeMmSpin(0.5, 300);
     ef->addRow(tr("種類"), regionKindCombo_);
-    ef->addRow(tr("X"), rxSpin_);
-    ef->addRow(tr("Y"), rySpin_);
-    ef->addRow(tr("寬"), rwSpin_);
-    ef->addRow(tr("高"), rhSpin_);
+    ef->addRow(tr("X 位置"), rxSpin_);
+    ef->addRow(tr("Y 位置"), rySpin_);
+    ef->addRow(tr("寬度"), rwSpin_);
+    ef->addRow(tr("高度"), rhSpin_);
     rl->addWidget(regionEditBox_);
     root->addWidget(regBox);
 
@@ -2333,6 +2590,7 @@ void DesignerWindow::applyUiScale() {
         tb->setStyleSheet(toolbarStyle());
         if (QToolButton* pb = tb->findChild<QToolButton*>(QStringLiteral("btnPrint"))) pb->setStyleSheet(printButtonStyle());
     }
+    for (QToolButton* b : { layerUpBtn_, layerDownBtn_ }) if (b) b->setFixedWidth(px(30));
     if (cursorLabel_) cursorLabel_->setMinimumWidth(px(260));
     if (recordLabel_) recordLabel_->setMinimumWidth(px(110));
     if (propertyPanel_) propertyPanel_->setMinimumWidth(px(300));
@@ -2367,6 +2625,8 @@ void DesignerWindow::populatePanel(const card::Element* e) {
     updating_ = true;
 
     propertyPanel_->setEnabled(e != nullptr);
+    propertyPanel_->setVisible(e != nullptr);          // 沒選取時隱藏欄位，改顯示說明
+    if (propHint_) propHint_->setVisible(e == nullptr);
     if (e) {
         nameEdit_->setText(e->name);
         typeLabel_->setText(typeText(*e));
@@ -2488,6 +2748,7 @@ void DesignerWindow::onSelectionChanged() {
         populateRegionEditor(nullptr);
     }
     updateActionStates();
+    updateHints();
 }
 
 void DesignerWindow::onItemChanged(const QString& id) {
@@ -2537,18 +2798,20 @@ void DesignerWindow::updateCursorLabel(const QPointF& scenePos, bool inside) {
 
 void DesignerWindow::commitUndo() {
     if (commitTimer_) commitTimer_->stop();
-    if (layout_.toJson() == baseline_.toJson()) return;
+    if (layout_.toJson() == baseline_.toJson()) { updateWindowTitle(); return; }
     undoStack_.push_back(baseline_);
     if (undoStack_.size() > kMaxUndo) undoStack_.erase(undoStack_.begin());
     redoStack_.clear();
     baseline_ = layout_;
     updateUndoActions();
+    updateWindowTitle();
 }
 
 void DesignerWindow::scheduleCommit() {
     if (updating_ || !commitTimer_) return;
     commitTimer_->start();                 // 重新計時
     if (actUndo_) actUndo_->setEnabled(true);
+    setWindowModified(true);               // 先標示「有修改」，停手後 commitUndo 會再精確比對一次
 }
 
 void DesignerWindow::updateUndoActions() {
@@ -2565,6 +2828,7 @@ void DesignerWindow::undo() {
     restoreLayout(prev);
     baseline_ = layout_;
     updateUndoActions();
+    updateWindowTitle();
     statusBar()->showMessage(tr("已復原 (還可復原 %1 步)").arg(undoStack_.size()), 3000);
 }
 
@@ -2577,6 +2841,7 @@ void DesignerWindow::redo() {
     restoreLayout(next);
     baseline_ = layout_;
     updateUndoActions();
+    updateWindowTitle();
     statusBar()->showMessage(tr("已重做 (還可重做 %1 步)").arg(redoStack_.size()), 3000);
 }
 

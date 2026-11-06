@@ -1,7 +1,9 @@
 ﻿// DesignerWindow: 卡面設計器主視窗 (階段 4：鍍膜範圍)。
 // 刻意不使用 Q_OBJECT：所有連線都用 lambda，所以不需要 moc 處理。
 #pragma once
+#include <QJsonObject>
 #include <QMainWindow>
+#include <QString>
 #include <functional>
 #include <utility>
 #include <vector>
@@ -34,6 +36,7 @@ class QShowEvent;
 class QCloseEvent;
 class QTimer;
 class QTableWidget;
+class QToolButton;
 class ElementItem;
 class RegionItem;
 
@@ -87,9 +90,18 @@ private:
     // 動作
     void addElement(card::ElementType type);
     void deleteSelected();
+    void reorderFromList();                // 在元素清單拖曳排序後，依清單順序更新圖層
     void moveLayer(int mode);              // 圖層順序：0 = 移到最上層、1 = 上移一層、2 = 下移一層、3 = 移到最下層
     void openLayout();
-    void saveLayout();
+    bool saveLayout();                     // 已有檔名就直接存；第一次存檔 (或未命名) 會問檔名。回傳 false = 沒有存成
+    bool saveLayoutAs();                   // 另存新檔
+    bool writeLayout(const QString& path);
+    bool maybeSave();                      // 關閉前：版面有改動就詢問 儲存 / 不儲存 / 取消；回傳 false = 取消
+    bool isDirty() const;                  // 目前版面與上次存檔 / 開啟時不同
+    void updateWindowTitle();              // 標題列：檔名 + 未儲存標記
+    void updateHints();                    // 狀態列左側的「現在可以做什麼」提示 (依選取狀態改變)
+    void updateDataEmptyState();           // 尚未載入 Excel 時，資料區顯示操作引導而不是空表格
+    void showHelp();                       // 操作說明
     void exportPreview();
     void openPrintDialog();                // 階段 3：批次列印
     void setOrientation(card::Orientation o);
@@ -147,6 +159,8 @@ private:
     void updateColorButton(const QColor& c);
 
     card::CardLayout layout_;
+    QString layoutPath_;                   // 目前版面的檔案路徑 (空 = 尚未存檔)
+    QJsonObject savedJson_;                // 上次存檔 / 開啟時的版面，用來判斷「是否有未儲存的修改」
     // 復原 / 重做
     std::vector<card::CardLayout> undoStack_;
     std::vector<card::CardLayout> redoStack_;
@@ -171,6 +185,10 @@ private:
     GuideOverlay* guides_ = nullptr;       // 拖曳時的對齊輔助線
     QLabel* recordLabel_ = nullptr;        // 工具列：「第 n / N 筆」
     QLabel* cursorLabel_ = nullptr;        // 狀態列右側：卡面尺寸、游標位置
+    QLabel* hintLabel_ = nullptr;          // 狀態列左側：操作提示
+    QToolButton* layerUpBtn_ = nullptr;    // 元素清單旁的 ▲：往上一層 (蓋住更多元素)
+    QToolButton* layerDownBtn_ = nullptr;  // 元素清單旁的 ▼：往下一層
+    QAction* actSaveAs_ = nullptr;
     QGraphicsRectItem* cardItem_ = nullptr;
 
     // 四個可開關的面板 (到「檢視」選單可重新開啟)
@@ -202,6 +220,7 @@ private:
 
     // 屬性面板
     QWidget* propertyPanel_ = nullptr;
+    QLabel* propHint_ = nullptr;           // 尚未選取元素時，取代空白屬性欄位的說明
     QLineEdit* nameEdit_ = nullptr;
     QLabel* typeLabel_ = nullptr;
     QDoubleSpinBox* xSpin_ = nullptr;
@@ -275,6 +294,7 @@ private:
     card::DataTable data_;
     QTableWidget* dataTable_ = nullptr;
     QLabel* dataInfo_ = nullptr;
+    QLabel* dataEmptyLabel_ = nullptr;     // 尚未載入 Excel 時的操作引導
     QLineEdit* dataFilter_ = nullptr;
     QString lastDataDir_;
 
